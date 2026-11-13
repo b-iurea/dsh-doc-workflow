@@ -1,0 +1,4 @@
+- insert:
+    - id: doc-workflow
+      name: '@local/doc-workflow'
+      config: {}
