@@ -12,13 +12,16 @@
  * rail (understanding / gaps / interview), the INTERVIEW block (delivery
  * chips code/docs with the answer-only badge, role pills, answered
  * timestamp), the ROLE CARDS block (preset status chip none / emitted /
- * skipped / stale, one pill per emitted card, skip-reason line),
+ * skipped / stale, one pill per emitted card, skip-reason line), the
+ * TASK DRAFTS block (tasks status chip pending / emitted / skipped /
+ * stale, one row per drafted task with subject, role pill, blocked_by
+ * chain count and write-scope code chips, skip-reason and warning lines),
  * verification results with per-entry pills (failed / unanchored /
  * unattested / suspect / external sources), the useful / non-useful entry
  * index with expandable details — external sources carry an 'ext' badge
  * since only a human can check them —, pending new documents and the plan
- * block. v2 state files without the interview / presets fields degrade to
- * locked / hidden sections, never a crash.
+ * block. v2/v3 state files without the interview / presets / tasks fields
+ * degrade to locked / hidden sections, never a crash.
  *
  * A ctx.timer interval re-stats the selected state file every 7 s and
  * reloads only when its version/bytes changed, so the panel follows the
@@ -72,6 +75,7 @@
           'stage.gaps': 'Gaps',
           'stage.interview': 'Interview',
           'stage.presets': 'Role cards',
+          'stage.tasks': 'Tasks',
           'stage.plan': 'Plan',
           'stage.done': 'Done',
           'stage.no-workflow': 'No workflow',
@@ -98,6 +102,13 @@
           'preset.emitted': 'emitted',
           'preset.skipped': 'skipped',
           'preset.stale': 'stale',
+          'tasks': 'Task drafts',
+          'task.pending': 'pending',
+          'task.emitted': 'emitted',
+          'task.skipped': 'skipped',
+          'task.stale': 'stale',
+          'task.blockedBy': 'blocked by',
+          'task.warnings': 'warnings',
           'verification': 'Verification',
           'ver.unverified': 'unverified',
           'ver.stale': 'stale',
@@ -165,6 +176,7 @@
           'stage.gaps': 'Lacune',
           'stage.interview': 'Colloquio',
           'stage.presets': 'Schede ruolo',
+          'stage.tasks': 'Task',
           'stage.plan': 'Piano',
           'stage.done': 'Fatto',
           'stage.no-workflow': 'Nessun workflow',
@@ -191,6 +203,13 @@
           'preset.emitted': 'emesse',
           'preset.skipped': 'omesse',
           'preset.stale': 'da rifare',
+          'tasks': 'Bozze di task',
+          'task.pending': 'in attesa',
+          'task.emitted': 'emesse',
+          'task.skipped': 'omesse',
+          'task.stale': 'da rifare',
+          'task.blockedBy': 'bloccato da',
+          'task.warnings': 'avvisi',
           'verification': 'Verifica',
           'ver.unverified': 'non verificata',
           'ver.stale': 'da rifare',
@@ -315,6 +334,7 @@
         '.dfp-code{font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;' +
           'background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1);' +
           'border-radius:4px;padding:0 4px;}',
+        '.dfp-chain{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px;white-space:nowrap;}',
         '.dfp-mid{display:flex;align-items:center;justify-content:center;gap:9px;padding:34px 0;' +
           'color:var(--dsw-alias-label-secondary);}',
         '.dfp-spin{width:15px;height:15px;border:2px solid var(--dsw-alias-border-l2);' +
@@ -343,18 +363,20 @@
         return s.slice(0, max - tail - 1) + '…' + s.slice(s.length - tail);
       }
       function known(table, name) { return table[name] ? true : false; }
-      var STAGE_NAMES = { 'reading': 1, 'indexing': 1, 'consistency': 1, 'extract': 1, 'verify': 1, 'recheck': 1, 'gaps': 1, 'interview': 1, 'presets': 1, 'plan': 1, 'done': 1, 'no-workflow': 1 };
+      var STAGE_NAMES = { 'reading': 1, 'indexing': 1, 'consistency': 1, 'extract': 1, 'verify': 1, 'recheck': 1, 'gaps': 1, 'interview': 1, 'presets': 1, 'plan': 1, 'tasks': 1, 'done': 1, 'no-workflow': 1 };
       var GATE_STATUS = { 'locked': 1, 'open': 1, 'asked': 1, 'pending': 1, 'answered': 1 };
       var VER_STATUS = { 'unverified': 1, 'stale': 1, 'passed': 1, 'failed': 1 };
       var CONS_STATUS = { 'n/a': 1, 'passed': 1, 'pending': 1, 'conflict': 1 };
       var PRESET_STATUS = { 'none': 1, 'emitted': 1, 'skipped': 1, 'stale': 1 };
+      var TASK_STATUS = { 'pending': 1, 'emitted': 1, 'skipped': 1, 'stale': 1 };
       var DELIVERY_KINDS = { 'code': 1, 'docs': 1 };
-      var STAGE_CHIP = { 'reading': 'dfp-c-neutral', 'indexing': 'dfp-c-neutral', 'consistency': 'dfp-c-brand', 'recheck': 'dfp-c-warn', 'gaps': 'dfp-c-brand', 'interview': 'dfp-c-brand', 'presets': 'dfp-c-brand', 'plan': 'dfp-c-brand', 'done': 'dfp-c-success' };
+      var STAGE_CHIP = { 'reading': 'dfp-c-neutral', 'indexing': 'dfp-c-neutral', 'consistency': 'dfp-c-brand', 'recheck': 'dfp-c-warn', 'gaps': 'dfp-c-brand', 'interview': 'dfp-c-brand', 'presets': 'dfp-c-brand', 'plan': 'dfp-c-brand', 'tasks': 'dfp-c-brand', 'done': 'dfp-c-success' };
       var VER_CHIP = { 'unverified': 'dfp-c-neutral', 'stale': 'dfp-c-warn', 'passed': 'dfp-c-success', 'failed': 'dfp-c-error' };
       var GATE_CHIP = { 'locked': 'dfp-c-neutral', 'open': 'dfp-c-brand', 'asked': 'dfp-c-warn', 'pending': 'dfp-c-warn', 'answered': 'dfp-c-success' };
       var CONS_CHIP = { 'n/a': 'dfp-c-neutral', 'passed': 'dfp-c-success', 'pending': 'dfp-c-warn', 'conflict': 'dfp-c-error' };
       var PRESET_CHIP = { 'none': 'dfp-c-neutral', 'emitted': 'dfp-c-success', 'skipped': 'dfp-c-neutral', 'stale': 'dfp-c-warn' };
-      var STEPS = ['reading', 'indexing', 'consistency', 'gaps', 'interview', 'presets', 'plan', 'done'];
+      var TASK_CHIP = { 'pending': 'dfp-c-neutral', 'emitted': 'dfp-c-success', 'skipped': 'dfp-c-neutral', 'stale': 'dfp-c-warn' };
+      var STEPS = ['reading', 'indexing', 'consistency', 'gaps', 'interview', 'presets', 'plan', 'tasks', 'done'];
 
       /** Read one whole file through the chunked byte window (graphify pattern). */
       async function readWholeFile(remote, sessionId, path, signal) {
@@ -706,6 +728,61 @@
               React.createElement('div', { class: 'dfp-box' }, kids));
           }
 
+          // Task-drafts block: status chip + one row per drafted task. The
+          // whole section is hidden when the field is absent (v3 states).
+          // Stale shows either as status === 'stale' (presets modelling) or
+          // as the optional stale flag over an emitted block (§5 chain).
+          function renderTasks(S) {
+            var tk = obj(S.tasks);
+            if (!tk) return null;
+            var status = known(TASK_STATUS, str(tk.status)) ? str(tk.status) : 'pending';
+            if (status === 'emitted' && tk.stale === true) status = 'stale';
+            var items = arr(tk.items);
+            var warnings = arr(tk.warnings);
+            var emittedAt = str(tk.emittedAt || tk.emitted_at);
+            var skipReason = str(tk.skipReason || tk.skip_reason);
+            var top = [React.createElement('span', {
+              key: 'st', class: 'dfp-chip ' + (TASK_CHIP[status] || 'dfp-c-neutral'),
+            }, t('task.' + status))];
+            if ((status === 'emitted' || status === 'stale') && emittedAt) {
+              top.push(React.createElement('span', { key: 'at', class: 'dfp-meta' }, fmtTime(emittedAt)));
+            }
+            var kids = [React.createElement('div', { key: 'top', class: 'dfp-row' }, top)];
+            if (status === 'skipped' && skipReason) {
+              kids.push(React.createElement('div', { key: 'skip', class: 'dfp-row' },
+                React.createElement('span', { class: 'dfp-none' }, skipReason)));
+            }
+            for (var i = 0; i < items.length; i++) {
+              var it = obj(items[i]);
+              if (!it) continue;
+              var desc = str(it.description);
+              var role = str(it.role);
+              var blocked = arr(it.blocked_by !== undefined ? it.blocked_by : it.blockedBy)
+                .map(str).filter(function (x) { return x !== ''; });
+              var scopes = arr(it.write_scopes !== undefined ? it.write_scopes : it.writeScopes)
+                .map(str).filter(function (x) { return x !== ''; });
+              var row = [
+                React.createElement('span', { key: 'sj', class: 'dfp-etitle', title: desc }, str(it.subject) || '—'),
+                role ? React.createElement('span', {
+                  key: 'rl', class: 'dfp-pill', title: str(it.why) || desc || undefined,
+                }, role) : null,
+                blocked.length ? React.createElement('span', {
+                  key: 'bl', class: 'dfp-chain', title: t('task.blockedBy') + ': ' + blocked.join(', '),
+                }, '⛓' + blocked.length) : null];
+              for (var w = 0; w < scopes.length; w++) {
+                row.push(React.createElement('span', { key: 'sc' + w, class: 'dfp-code' }, scopes[w]));
+              }
+              kids.push(React.createElement('div', { key: 't' + i, class: 'dfp-row' }, row));
+            }
+            for (var g = 0; g < warnings.length; g++) {
+              kids.push(React.createElement('div', { key: 'w' + g, class: 'dfp-row' },
+                React.createElement('span', { class: 'dfp-warnbadge' }, t('task.warnings') + ': ' + str(warnings[g]))));
+            }
+            return React.createElement('div', null,
+              sectionHead(t('tasks')),
+              React.createElement('div', { class: 'dfp-box' }, kids));
+          }
+
           function pillRow(label, ids, cls) {
             var kids = [React.createElement('span', { key: 'l', class: 'dfp-lbl' }, label)];
             for (var i = 0; i < ids.length; i++) {
@@ -908,6 +985,7 @@
               renderGates(S),
               renderInterview(S),
               renderPresets(S),
+              renderTasks(S),
               renderVerification(S),
               renderEntries(S),
               renderPending(S),
