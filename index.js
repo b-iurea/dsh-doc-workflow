@@ -68,6 +68,17 @@ const GATE_DOCS = {
   interview: { file: 'questions-interview.md', header: '# Interview questions\n\n' },
 }
 
+// v1.3.1 §1: the reflow ladder — re-run step X, invalidate downstream artifacts.
+// 'recheck' is the failed-verify parking position for indexing; 'done' sits past
+// the ladder (pos 99) so every target is legal from it. no-workflow (no state) is N/A.
+const REFLOW_ORDER = ['reading', 'indexing', 'consistency', 'gaps', 'interview', 'presets', 'plan', 'tasks']
+
+function stagePos(stage) {
+  if (stage === 'recheck') return REFLOW_ORDER.indexOf('indexing')
+  if (stage === 'done') return 99
+  return REFLOW_ORDER.indexOf(stage)
+}
+
 const FACT_PATTERNS = [
   { kind: 'date', re: /\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[/.]\d{1,2}[/.]\d{2,4}\b/g },
   { kind: 'version', re: /\bv\d+(?:\.\d+){0,3}\b/gi },
@@ -443,6 +454,8 @@ function statusPayload(state, dirAbs) {
       : { status: 'pending', stale: false, warnings: [], count: 0 },
     verification: state.verification.status,
     verified: overallVerified(state),
+    // v1.3.1 §3: the legal reflow targets, discoverable for agents (panel can compute them too)
+    reflow_targets: REFLOW_ORDER.slice(0, stagePos(state.stage) + 1),
     consistency: (() => {
       const cl = consistencyLayout(state)
       return { status: state.consistency.status, pairs: cl.pairs.length, missing: cl.missing, conflicts: cl.conflicts }
@@ -1157,6 +1170,107 @@ async function runDocflow(ctx, exec, args) {
       }
     }
 
+    case 'reflow': {
+      // v1.3.1 (§1–§2): re-run a step at or upstream of the current stage, invalidating
+      // downstream artifacts. Never touched: objective, doc_roots, createdAt, entries,
+      // gate history files — invalidation is expressed only through the staleness machinery.
+      if (typeof args.to_stage !== 'string' || REFLOW_ORDER.indexOf(args.to_stage) === -1)
+        return fail(`reflow requires to_stage: one of ${REFLOW_ORDER.join(', ')}.`, 'reflow re-runs the named step — the current stage or an earlier one.')
+      const target = REFLOW_ORDER.indexOf(args.to_stage)
+      const pos = stagePos(state.stage)
+      if (target > pos)
+        return fail(
+          `Cannot reflow to "${args.to_stage}" from stage "${state.stage}" — reflow never jumps forward. Legal targets from "${state.stage}": ${REFLOW_ORDER.slice(0, pos + 1).join(', ')}.`,
+          'Pick the current or an earlier step; advancing stays gated by the normal rules.',
+        )
+      const presetsWas = state.presets?.status
+      const tasksWasStale = !!state.tasks?.stale
+      const kept = ['objective + doc_roots', 'entries (all preserved — invalidation of derived state happens through the existing staleness machinery, never silently)', 'gate history files (questions-*.md)']
+      const invalidated = []
+      const staleChain = () => {
+        if (presetsWas === 'emitted' && state.presets?.status === 'stale') invalidated.push('emitted role cards marked stale (re-emit or re-confirm needed)')
+        if (!tasksWasStale && state.tasks?.stale) invalidated.push('task drafts marked stale (re-emit after upstream re-run)')
+      }
+      switch (args.to_stage) {
+        case 'reading':
+          state.stage = 'reading'
+          kept.push('verification, consistency, presets, plan and tasks all kept — a re-read alone invalidates nothing; entry edits then trigger the normal staleness machinery')
+          break
+        case 'indexing':
+          state.verification = { status: 'unverified', lastRun: undefined, failed: [], unanchored: [], unattested: [], suspect: [], externals: [] }
+          state.consistency.verdicts = {}
+          recomputeConsistency(state)
+          presetsStale(state)
+          state.stage = 'indexing' // held even when recompute yields passed/n/a: the user is re-running extraction, no automatic advance
+          invalidated.push('integrity verification reset to unverified (re-score and re-verify after re-extraction)', 'consistency verdicts cleared (every pair must be re-reviewed after verify)')
+          staleChain()
+          break
+        case 'consistency': {
+          state.consistency.verdicts = {}
+          const cs = recomputeConsistency(state)
+          presetsStale(state)
+          kept.push(`verification kept as-is (status: ${state.verification.status})`)
+          invalidated.push('consistency verdicts cleared (missing pairs -> pending; re-run crosscheck)')
+          if (cs === 'passed' || cs === 'n/a') {
+            // zero-verdict pass (0-1 useful entries): replicate the verify-pass routing, do not park on consistency
+            if (state.gates.gaps?.status === 'answered') afterGapsAnswered(state)
+            else {
+              state.stage = 'gaps'
+              state.gates.gaps.status = 'open'
+            }
+            invalidated.push(`consistency recompute = ${cs}: routed past consistency by the verify-pass rules`)
+          } else {
+            state.stage = 'consistency'
+          }
+          staleChain()
+          break
+        }
+        case 'gaps':
+          state.gates.gaps = { ...state.gates.gaps, status: 'open', reconfirm: true }
+          state.gates.interview.status = 'open'
+          state.gates.interview.reconfirm = true
+          presetsStale(state)
+          state.stage = 'gaps'
+          invalidated.push('gaps gate reopened for re-confirmation (past answers kept as history)', 'interview gate reopened for re-confirmation', 'the confirmed role set is re-required (re-answering the interview overwrites presets/tasks)')
+          staleChain()
+          break
+        case 'interview':
+          state.gates.interview.status = 'open'
+          state.gates.interview.reconfirm = true
+          presetsStale(state)
+          state.stage = 'interview'
+          kept.push('interview record kept — re-answering overwrites it and triggers the normal presetsStale inside gate_answer')
+          invalidated.push('interview gate reopened for re-confirmation')
+          staleChain()
+          break
+        case 'presets':
+          state.presets = { status: 'pending' } // full reset — deliberately different from presetsStale (see §2 note)
+          if (state.tasks?.status === 'emitted') state.tasks.stale = true
+          state.stage = 'presets'
+          kept.push('interview record + gate answers', 'agents/ + PRESETS.md files stay on disk as reference')
+          invalidated.push('role cards reset to pending: write_plan is blocked until presets are re-emitted')
+          if (!tasksWasStale && state.tasks?.stale) invalidated.push('task drafts marked stale (re-emit after the cards)')
+          break
+        case 'plan':
+          state.plan = {}
+          if (state.tasks?.status === 'emitted') state.tasks.stale = true
+          state.stage = 'plan'
+          kept.push('presets untouched')
+          invalidated.push('plan block cleared (write_plan re-stamps NOTES.md/PLAN.md; files stay as reference)')
+          if (!tasksWasStale && state.tasks?.stale) invalidated.push('task drafts marked stale (re-emit after the plan)')
+          break
+        case 'tasks':
+          delete state.tasks // status then synthesizes {status:'pending'} (v3.1 §1); the TASKS.md file stays as reference
+          state.stage = 'tasks'
+          kept.push('presets + plan untouched', 'TASKS.md file stays on disk as reference')
+          invalidated.push('task drafts block removed — re-run emit_tasks to regenerate TASKS.md')
+          break
+      }
+      state.updatedAt = now()
+      await writeJson(path.join(dirAbs, 'state.json'), state)
+      await renderIndex(dirAbs, state)
+      return { ok: true, reflowed_to: args.to_stage, stage: state.stage, kept, invalidated, next: guidanceFor(state) }
+    }
     case 'ingest': {
       if (!Array.isArray(args.paths) || args.paths.length === 0) return fail('ingest requires paths: new or changed documents.')
       state.pendingDocs = [...new Set([...(state.pendingDocs || []), ...args.paths])]
@@ -1189,7 +1303,7 @@ async function runDocflow(ctx, exec, args) {
     }
 
     default:
-      return fail(`Unknown action ${action}.`, 'Actions: status, start, gate_ask, gate_answer, add_entries, update_entry, remove_entry, attest, verify, crosscheck, emit_presets, emit_tasks, ingest, write_plan, reset.')
+      return fail(`Unknown action ${action}.`, 'Actions: status, start, gate_ask, gate_answer, add_entries, update_entry, remove_entry, attest, verify, crosscheck, emit_presets, emit_tasks, reflow, ingest, write_plan, reset.')
   }
 }
 
@@ -1202,14 +1316,14 @@ function makeTool(ctx) {
     name: 'docflow',
   description:
     'Document-driven workflow engine for project work: turn project documents into a source-verified index and a plan. ' +
-    'Stage machine: start(objective, doc_roots) -> read docs -> understanding gate (ask the user via ask_user_question, then gate_ask/gate_answer phase=understanding) -> add_entries (useful/not-useful filtered info; every entry MUST carry a verbatim source_quote plus source_kind "doc" (project source_file) or "external" (source_ref URL/path) — assumed content is rejected) -> attest(ok|suspect; trusted for external sources after human review) trustworthiness -> verify = INTEGRITY check (source readable + quote found verbatim; unvouched external sources keep it from passing; failures send you back to re-read and fix) -> CONSISTENCY phase: crosscheck records one verdict per pair of useful entries (consistent|conflict); conflicts block the workflow until the entries are corrected and re-reviewed -> gaps gate (ask the user what information is missing to reach the objective, phase=gaps) -> interview gate (phase=interview: propose the agent roles + delivery type code/docs/answer-only, the user confirms via gate_answer with the interview payload) -> emit_presets writes source-backed agent role cards under agents/ + PRESETS.md (answer-only skips presets explicitly) -> write_plan(notes_md, plan_md) -> emit_tasks (TEAM BRIDGE, only when presets were emitted): team task drafts rendered to TASKS.md, each 1:1 mappable to team_task_create (subject/description/role/plan_phase/write_scopes/blocked_by), or an explicit skip via tasks=[] + skip_reason. ' +
+    'Stage machine: start(objective, doc_roots) -> read docs -> understanding gate (ask the user via ask_user_question, then gate_ask/gate_answer phase=understanding) -> add_entries (useful/not-useful filtered info; every entry MUST carry a verbatim source_quote plus source_kind "doc" (project source_file) or "external" (source_ref URL/path) — assumed content is rejected) -> attest(ok|suspect; trusted for external sources after human review) trustworthiness -> verify = INTEGRITY check (source readable + quote found verbatim; unvouched external sources keep it from passing; failures send you back to re-read and fix) -> CONSISTENCY phase: crosscheck records one verdict per pair of useful entries (consistent|conflict); conflicts block the workflow until the entries are corrected and re-reviewed -> gaps gate (ask the user what information is missing to reach the objective, phase=gaps) -> interview gate (phase=interview: propose the agent roles + delivery type code/docs/answer-only, the user confirms via gate_answer with the interview payload) -> emit_presets writes source-backed agent role cards under agents/ + PRESETS.md (answer-only skips presets explicitly) -> write_plan(notes_md, plan_md) -> emit_tasks (TEAM BRIDGE, only when presets were emitted): team task drafts rendered to TASKS.md, each 1:1 mappable to team_task_create (subject/description/role/plan_phase/write_scopes/blocked_by), or an explicit skip via tasks=[] + skip_reason -> reflow(to_stage): re-run any step at or upstream of the current stage, invalidating downstream artifacts (entries and gates history are never silently dropped). ' +
     'New documents arrive via ingest and re-enter the loop. status returns the current stage, gate/verification/consistency state and the exact next steps — follow its "next" guidance. The workflow state lives in a .doc-workflow/ folder in the session workspace (objective.md, index.md, questions-*.md, verification.md, consistency.md, agents/<role>.md, PRESETS.md, NOTES.md, PLAN.md, TASKS.md). Use this tool whenever asked to analyze project documents toward an objective, build/update index.md, verify source reliability or logical coherence, or write notes/plan from documentation.',
   parameters: {
     type: 'object',
     properties: {
       action: {
         type: 'string',
-        enum: ['status', 'start', 'gate_ask', 'gate_answer', 'add_entries', 'update_entry', 'remove_entry', 'attest', 'verify', 'crosscheck', 'emit_presets', 'emit_tasks', 'ingest', 'write_plan', 'reset'],
+        enum: ['status', 'start', 'gate_ask', 'gate_answer', 'add_entries', 'update_entry', 'remove_entry', 'attest', 'verify', 'crosscheck', 'emit_presets', 'emit_tasks', 'reflow', 'ingest', 'write_plan', 'reset'],
       },
       objective: { type: 'string', description: 'start: the work objective as defined by the user.' },
       doc_roots: { type: 'array', items: { type: 'string' }, description: 'start: documents/directories to read.' },
@@ -1258,6 +1372,7 @@ function makeTool(ctx) {
         description: 'emit_tasks: one draft per unit of work; the array may be empty only together with skip_reason.',
       },
       skip_reason: { type: 'string', description: 'emit_tasks: explicit skip when no task drafts make sense (mirrors the presets skip semantics).' },
+      to_stage: { type: 'string', enum: [...REFLOW_ORDER], description: 'reflow: the step to re-run from; must be the current or an earlier step' },
       entries: {
         type: 'array',
         items: {

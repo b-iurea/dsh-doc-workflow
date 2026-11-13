@@ -29,8 +29,10 @@ flowchart TD
     G --> T[emit_tasks: task drafts per plan phase<br>role + write_scopes + blockers → TASKS.md]
     G -. "no execution roles" .-> U[emit_tasks skipped<br>reason recorded]
     P -. "new docs / re-answer ⇒ stale" .-> B
+    T -. "reflow(to_stage): restart from any step ≤ current,<br>downstream artifacts invalidated" .-> B
 ```
 
+- **Reflow (v1.3.1)**: a workflow rarely needs a full reset — usually just one step has to be redone. `docflow reflow to_stage=<step>` restarts from any step at or upstream of the current stage (never forward, never the objective itself) and invalidates exactly the downstream artifacts per a fixed effect matrix: re-running `indexing` clears the verification + verdicts, re-running `gaps` re-opens the gaps gate and marks the interview for reconfirmation, re-running `presets` demands a fresh `emit_presets` before the plan can be written again, and so on — while the objective, the extracted entries and every gate's history are **never** silently dropped. The panel's stage rail turns each reachable step into a clickable box showing what that step last produced, with a **"Resume from here"** button that injects the reflow request straight back into the chat (the agent runs `docflow reflow` and continues; copy-paste fallback only if the session is not live).
 - **Comprehension gate** (red line 1): before extracting anything, the agent must ask you what is ambiguous about the objective *given these documents*, and you must answer.
 - **Two scrapes**: useful entries (`U1…`) and explicitly rejected ones (`N1…`) both land in `index.md`, so the filtering is reviewable, not invisible.
 - **Source-backed only (v2)**: every entry carries a written source — either an internal doc (`source_file` + **mandatory verbatim `source_quote`**) or an external one (`source_ref` URL/path + quote). Content without a quote is rejected at admission: nothing is ever *assumed*.
@@ -46,7 +48,7 @@ flowchart TD
 
 | Piece | What it does |
 |---|---|
-| `docflow` host tool | The whole state machine, one tool with an `action` parameter: `status · start · gate_ask · gate_answer · add_entries · update_entry · remove_entry · attest · verify · crosscheck · emit_presets · emit_tasks · ingest · write_plan · reset`. Every result carries a `next[]` list of the exact next steps; a system-prompt section keeps the agent driving the workflow literally. |
+| `docflow` host tool | The whole state machine, one tool with an `action` parameter: `status · start · gate_ask · gate_answer · add_entries · update_entry · remove_entry · attest · verify · crosscheck · emit_presets · emit_tasks · ingest · write_plan · reflow · reset`. Every result carries a `next[]` list of the exact next steps; a system-prompt section keeps the agent driving the workflow literally. |
 | State on disk | `<cwd>/.doc-workflow/` — `state.json`, `objective.md`, `index.md`, `questions-understanding.md`, `questions-gaps.md`, `questions-interview.md`, `verification.md`, `consistency.md`, `PRESETS.md`, `agents/*.md`, `TASKS.md`, `NOTES.md`, `PLAN.md`. Plain files: greppable, diffable, survives sessions. |
 | Right-sidebar panel | A live read-only dashboard (tab **Document workflow**): stage rail with the v2 *consistency*, v3 *interview → role cards* and v3.1 *task drafts* phases, a VERIFIED/pending/conflict banner, integrity pills + the consistency matrix (missing pairs, conflict notes), gates (understanding / gaps / interview), the interview block (delivery chips + proposed/confirmed roles), the role-card block (emitted / skipped / stale + per-card pills), the task-draft block (rows with role pill, blockers, write-scope chips), expandable U/N entries with source badge (internal / external `ext`), verify/attest dots and the verbatim quote, pending new documents and the plan block. Auto-refreshes every 7 s, discovers one panel per project in the workspace. |
 
@@ -81,7 +83,7 @@ npm run check    # host + client + suite must parse
 npm test         # regression suite (prints its own assertion count), exits 0
 ```
 
-The e2e suite drives the real host module through the full happy path plus the failure loops (bogus quote → verify fails → `recheck` → fix → passes → gaps → interview → presets → plan → tasks → done; conflict → fix → re-review; answer-only skip path; un-re-answered interview blocks presets; unknown-role / cyclic `emit_tasks` rejected; v1/v2/v3-legacy state migration) with guardrail checks at every stage-gate. CI runs it on Node 20/22/24 via GitHub Actions (`.github/workflows/ci.yml`).
+The e2e suite drives the real host module through the full happy path plus the failure loops (bogus quote → verify fails → `recheck` → fix → passes → gaps → interview → presets → plan → tasks → done; conflict → fix → re-review; answer-only skip path; un-re-answered interview blocks presets; unknown-role / cyclic `emit_tasks` rejected; `reflow` legality + the full per-target invalidation matrix, including a reflow-restart→re-emit round trip back to `done`; v1/v2/v3-legacy state migration) with guardrail checks at every stage-gate. CI runs it on Node 20/22/24 via GitHub Actions (`.github/workflows/ci.yml`).
 
 After editing the host half in a live profile, toggle the plugin (e.g. `include:doc-workflow` off/on) to hot-reload; after editing the client half, reinstall (`remove_bundle` + `install_bundle`) so the client manifest is re-synced.
 
@@ -95,6 +97,7 @@ locale/{en,it}.json   bundle meta
 icon.svg              tab/plugin icon
 DESIGN-v3.md          implementation contract for the interview/presets (v3) flow
 DESIGN-v3.1.md        implementation contract for emit_tasks / task drafts (v3.1)
+DESIGN-v1.3.1.md      implementation contract for reflow / step-level restart (v1.3.1)
 test/e2e.mjs          headless regression suite (+ test/docs fixtures)
 .github/workflows/ci.yml   GitHub Actions: npm run check + npm test on Node 20/22/24
 ```

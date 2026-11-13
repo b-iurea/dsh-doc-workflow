@@ -497,6 +497,263 @@ r = await call({ action: 'ingest', paths: ['docs/new.md'] })
   d7.forEach((d) => d())
 }
 
+// ---------------------------------------------------------------------------
+// 18. v1.3.1 reflow — DESIGN-v1.3.1.md §6 expectations (appended checks R1..R16)
+// ---------------------------------------------------------------------------
+{
+  // §3 surface: enum wiring, to_stage param, description mention (guidance untouched)
+  record('R1', tool.parameters.properties.action.enum.includes('reflow') &&
+    tool.parameters.properties.action.enum.indexOf('reflow') === tool.parameters.properties.action.enum.indexOf('emit_tasks') + 1 &&
+    JSON.stringify(tool.parameters.properties.to_stage.enum) === '["reading","indexing","consistency","gaps","interview","presets","plan","tasks"]' &&
+    /-> reflow\(to_stage\): re-run any step at or upstream of the current stage/.test(tool.description),
+  'tool surface §3: action enum += reflow after emit_tasks, to_stage enum of 8, description mentions reflow')
+
+  // §6 starting fixture: full flow to done — U1..U4 + full verdicts + presets emitted + tasks emitted
+  const reflowEntries = () => ({
+    U1: { useful: true, title: 't1', content: 'c1', source_kind: 'doc', source_file: 'docs/api.md', source_quote: 'q1', addedAt: 'x' },
+    U2: { useful: true, title: 't2', content: 'c2', source_kind: 'doc', source_file: 'docs/api.md', source_quote: 'q2', addedAt: 'x' },
+    U3: { useful: true, title: 't3', content: 'c3', source_kind: 'doc', source_file: 'docs/api.md', source_quote: 'q3', addedAt: 'x' },
+    U4: { useful: true, title: 't4', content: 'c4', source_kind: 'external', source_ref: 'https://example.com/x', source_quote: 'q4', addedAt: 'x' },
+    N1: { useful: false, title: 'n1', content: 'cn', source_kind: 'doc', source_file: 'docs/meeting.md', source_quote: 'qn', addedAt: 'x' },
+  })
+  const allVerdicts = () => {
+    const ids = ['U1', 'U2', 'U3', 'U4']
+    const v = {}
+    for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) v[[ids[i], ids[j]].sort().join('|')] = { verdict: 'consistent', note: 'fixture', at: 'x' }
+    return v
+  }
+  const doneFixture = (overrides) =>
+    v3State({
+      stage: 'done',
+      entries: reflowEntries(),
+      consistency: { status: 'passed', verdicts: allVerdicts(), updatedAt: 'x' },
+      tasks: { status: 'emitted', emittedAt: 'x', items: [{ id: 't1', subject: 'T1', description: 'd', role: 'Migrator', plan_phase: 'P', write_scopes: [], blocked_by: [] }], warnings: [] },
+      ...overrides,
+    })
+  async function reflowCase(name, stateObj) {
+    const dirp = path.join(ROOT, 'ws-reflow-' + name)
+    await fs.rm(dirp, { recursive: true, force: true })
+    await fs.mkdir(path.join(dirp, '.doc-workflow'), { recursive: true })
+    await fs.writeFile(path.join(dirp, '.doc-workflow/state.json'), JSON.stringify(stateObj), 'utf8')
+    const { tool: tt, disposers: dd } = stubTool(dirp)
+    const readState = async () => JSON.parse(await fs.readFile(path.join(dirp, '.doc-workflow/state.json'), 'utf8'))
+    return { dirp, tt, dd, readState }
+  }
+  const canon = (v) => JSON.stringify(v, (k, val) => (val && typeof val === 'object' && !Array.isArray(val) ? Object.fromEntries(Object.entries(val).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : val))
+  const stripTime = (o) => { const x = JSON.parse(JSON.stringify(o)); delete x.updatedAt; return x }
+
+  // §1 legality from "presets" + enum validation on bad/missing to_stage
+  {
+    const c = await reflowCase('legality', doneFixture({ stage: 'presets' }))
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'tasks' })
+    record('R2a', r.ok === false && /from stage "presets"/.test(r.error) && /Legal targets from "presets": reading, indexing, consistency, gaps, interview, presets/.test(r.error), 'reflow(tasks) from presets rejected naming current stage + legal targets: ' + r.error)
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'plan' })
+    record('R2b', r.ok === false && /from stage "presets"/.test(r.error), 'reflow(plan) from presets rejected — forward jumps stay gated')
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'presets' })
+    record('R2c', r.ok === true && r.reflowed_to === 'presets' && r.stage === 'presets', 'target == current is legal (re-run in place)')
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'nope' })
+    record('R2d', r.ok === false && r.error === 'reflow requires to_stage: one of reading, indexing, consistency, gaps, interview, presets, plan, tasks.', 'unknown to_stage rejected with the enum')
+    r = await callOn(c.tt, { action: 'reflow' })
+    record('R2e', r.ok === false && /to_stage/.test(r.error), 'missing to_stage rejected with the enum')
+    c.dd.forEach((d) => d())
+  }
+
+  // from done every target is legal; response carries the §2 tail fields
+  {
+    const c = await reflowCase('done-all', doneFixture())
+    r = await callOn(c.tt, { action: 'status' })
+    record('R3a', JSON.stringify(r.reflow_targets) === '["reading","indexing","consistency","gaps","interview","presets","plan","tasks"]', 'status reflow_targets at done = all 8 steps')
+    const outs = []
+    for (const t of ['tasks', 'plan', 'presets', 'interview', 'gaps', 'consistency', 'indexing', 'reading'])
+      outs.push(await callOn(c.tt, { action: 'reflow', to_stage: t }))
+    record('R3b', outs.every((o) => o.ok === true && o.stage === o.reflowed_to && Array.isArray(o.kept) && o.kept.length > 0 && Array.isArray(o.invalidated) && o.invalidated.every((x) => typeof x === 'string') && Array.isArray(o.next)) && outs.at(-1).stage === 'reading', 'from done every target legal; kept[]/invalidated[] readable strings; stage===reflowed_to; next present')
+    c.dd.forEach((d) => d())
+  }
+
+  // §1 recheck behaves as indexing position
+  {
+    const c = await reflowCase('recheck', doneFixture({ stage: 'recheck' }))
+    r = await callOn(c.tt, { action: 'status' })
+    record('R4a', JSON.stringify(r.reflow_targets) === '["reading","indexing"]', 'status reflow_targets at recheck maps to the indexing position')
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'indexing' })
+    record('R4b', r.ok === true && r.stage === 'indexing', 'reflow(indexing) from recheck is legal')
+    const c2 = await reflowCase('recheck2', doneFixture({ stage: 'recheck' }))
+    r = await callOn(c2.tt, { action: 'reflow', to_stage: 'consistency' })
+    record('R4c', r.ok === false && /from stage "recheck"/.test(r.error) && /Legal targets from "recheck": reading, indexing/.test(r.error), 'reflow(consistency) from recheck rejected naming "recheck": ' + r.error)
+    c.dd.forEach((d) => d())
+    c2.dd.forEach((d) => d())
+  }
+
+  // reflow(reading): nothing cleared — deep-equal bar stage + updatedAt
+  {
+    const c = await reflowCase('reading', doneFixture())
+    const seed = await c.readState()
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'reading' })
+    const st = await c.readState()
+    record('R5', r.ok && st.stage === 'reading' && r.invalidated.length === 0 && st.updatedAt !== seed.updatedAt &&
+      canon(stripTime(st)) === canon(stripTime({ ...seed, stage: 'reading' })), 'reflow(reading): only stage + updatedAt change, invalidated empty')
+    c.dd.forEach((d) => d())
+  }
+
+  // §2 cascade indexing (fresh verification shell, verdicts cleared, HOLD at indexing)
+  {
+    const c = await reflowCase('indexing', doneFixture())
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'indexing' })
+    const st = await c.readState()
+    record('R6a', r.ok && r.reflowed_to === 'indexing' && st.stage === 'indexing' &&
+      st.verification.status === 'unverified' && st.verification.failed.length === 0 && st.verification.unanchored.length === 0 && st.verification.unattested.length === 0 && st.verification.suspect.length === 0 && st.verification.externals.length === 0 &&
+      Object.keys(st.consistency.verdicts).length === 0 && st.consistency.status === 'pending' &&
+      st.presets.status === 'stale' && st.tasks.status === 'emitted' && st.tasks.stale === true &&
+      JSON.stringify(Object.keys(st.entries).sort()) === '["N1","U1","U2","U3","U4"]',
+    'reflow(indexing): verification fresh shell, verdicts {} -> pending, HOLD stage indexing (no auto-route despite recompute), presets+tasks stale, entries kept')
+    r = await callOn(c.tt, { action: 'status' })
+    record('R6b', r.reflow_targets.length === 2 && r.reflow_targets[1] === 'indexing', 'status reflow_targets at indexing = reading,indexing')
+    c.dd.forEach((d) => d())
+  }
+
+  // §2 cascade consistency (verification kept, verdicts cleared, stage consistency)
+  {
+    const c = await reflowCase('consistency', doneFixture())
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'consistency' })
+    const st = await c.readState()
+    record('R7', r.ok && st.stage === 'consistency' && st.verification.status === 'passed' && st.verification.lastRun === 'x' &&
+      Object.keys(st.consistency.verdicts).length === 0 && st.consistency.status === 'pending' &&
+      st.presets.status === 'stale' && st.tasks.stale === true, 'reflow(consistency): verification kept (passed, lastRun x), verdicts {} -> pending, presets+tasks stale')
+    c.dd.forEach((d) => d())
+  }
+
+  // §2 consistency n/a subcase: replicate verify-pass routing
+  {
+    const entries = reflowEntries()
+    for (const id of ['U2', 'U3', 'U4']) entries[id].useful = false
+    const c = await reflowCase('con-na', doneFixture({ entries }))
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'consistency' })
+    const st = await c.readState()
+    record('R8a', r.ok && r.stage === 'presets' && st.stage === 'presets' && st.consistency.status === 'n/a' && st.gates.gaps.status === 'answered', 'reflow(consistency) n/a + gaps answered: afterGapsAnswered routing lands at presets (presets stale)')
+    c.dd.forEach((d) => d())
+  }
+  {
+    const entries = reflowEntries()
+    for (const id of ['U2', 'U3', 'U4']) entries[id].useful = false
+    const c = await reflowCase('con-na2', doneFixture({
+      entries,
+      gates: {
+        understanding: { status: 'answered', asked: true, answered: true },
+        gaps: { status: 'pending', asked: true, answered: false },
+        interview: { status: 'locked' },
+      },
+    }))
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'consistency' })
+    const st = await c.readState()
+    record('R8b', r.ok && r.stage === 'gaps' && st.stage === 'gaps' && st.gates.gaps.status === 'open' && st.gates.gaps.answered === false && st.gates.interview.status === 'locked', 'reflow(consistency) n/a + gaps unanswered: stage gaps + gaps gate opened (history flags kept), interview untouched')
+    c.dd.forEach((d) => d())
+  }
+
+  // §2 cascade gaps (reopen with reconfirm, history kept, interview chain reopened)
+  {
+    const c = await reflowCase('gaps', doneFixture())
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'gaps' })
+    const st = await c.readState()
+    record('R9', r.ok && st.stage === 'gaps' && st.gates.gaps.status === 'open' && st.gates.gaps.reconfirm === true && st.gates.gaps.asked === true && st.gates.gaps.answered === true &&
+      st.gates.interview.status === 'open' && st.gates.interview.reconfirm === true &&
+      st.presets.status === 'stale' && st.tasks.stale === true, 'reflow(gaps): gaps open+reconfirm with asked/answered history kept, interview reopened, presets+tasks stale')
+    c.dd.forEach((d) => d())
+  }
+
+  // §2 cascade interview (record kept, gate reopened)
+  {
+    const c = await reflowCase('interview', doneFixture())
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'interview' })
+    const st = await c.readState()
+    record('R10', r.ok && st.stage === 'interview' && st.gates.interview.status === 'open' && st.gates.interview.reconfirm === true &&
+      JSON.stringify(st.interview.roles) === '["Migrator"]' && st.interview.answeredAt === 'x' &&
+      st.presets.status === 'stale' && st.tasks.stale === true && st.gates.gaps.status === 'answered', 'reflow(interview): gate open+reconfirm, interview record kept, presets+tasks stale, gaps untouched')
+    c.dd.forEach((d) => d())
+  }
+
+  // §2 cascade presets: full reset + write_plan blocked until re-emit + full return-to-done chain
+  {
+    const c = await reflowCase('presets', doneFixture())
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'presets' })
+    const st = await c.readState()
+    record('R11a', r.ok && st.stage === 'presets' && canon(st.presets) === '{"status":"pending"}' && st.tasks.stale === true, 'reflow(presets): presets fully reset to pending (cards cleared), tasks stale-chain')
+    r = await callOn(c.tt, { action: 'write_plan', notes_md: 'n', plan_md: 'p' })
+    record('R11b', r.ok === false && /stage "plan"/.test(r.error) && /current: presets/.test(r.error), 'write_plan rejected after reflow(presets) until presets re-emitted: ' + r.error)
+    r = await callOn(c.tt, { action: 'emit_presets', cards: [{ role: 'Migrator', why: 'fixture re-emit', source_entries: ['U1'], prompt_body: 'p' }] })
+    record('R11c', r.ok && r.stage === 'plan', 're-emitting presets after reflow(presets) -> plan')
+    r = await callOn(c.tt, { action: 'write_plan', notes_md: 'n', plan_md: 'x\n\n## Fasi\n\n**P1**\n' })
+    record('R11d', r.ok && r.stage === 'tasks', 'write_plan lands at tasks (presets emitted again)')
+    r = await callOn(c.tt, { action: 'emit_tasks', tasks: [{ subject: 'Reflowed task', description: 'd', role: 'Migrator', plan_phase: 'P1' }] })
+    record('R11e', r.ok && r.stage === 'done', 'full re-emit after reflow(presets) returns to done — guards fired correctly in between')
+    c.dd.forEach((d) => d())
+  }
+
+  // §2 cascade plan: block cleared, presets untouched, tasks stale
+  {
+    const c = await reflowCase('plan', doneFixture())
+    await fs.writeFile(path.join(c.dirp, '.doc-workflow/NOTES.md'), '# NOTES\n\nmarker: file stays as reference\n', 'utf8')
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'plan' })
+    const st = await c.readState()
+    const notes = await fs.readFile(path.join(c.dirp, '.doc-workflow/NOTES.md'), 'utf8')
+    record('R12', r.ok && st.stage === 'plan' && canon(st.plan) === '{}' && st.presets.status === 'emitted' && st.presets.cards.length === 1 && st.tasks.stale === true && notes.includes('file stays as reference'), 'reflow(plan): plan block cleared, presets untouched, tasks stale, NOTES.md file kept')
+    c.dd.forEach((d) => d())
+  }
+
+  // §2 cascade tasks: block deleted (status synthesizes pending), TASKS.md file stays
+  {
+    const c = await reflowCase('tasks', doneFixture())
+    await fs.writeFile(path.join(c.dirp, '.doc-workflow/TASKS.md'), '# Task drafts\n\nmarker: file stays as reference\n', 'utf8')
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'tasks' })
+    const st = await c.readState()
+    const doc = await fs.readFile(path.join(c.dirp, '.doc-workflow/TASKS.md'), 'utf8')
+    r = await callOn(c.tt, { action: 'status' })
+    record('R13a', st.stage === 'tasks' && st.tasks === undefined && doc.includes('file stays as reference'), 'reflow(tasks): drafts block deleted, TASKS.md file kept as reference')
+    record('R13b', r.tasks.status === 'pending' && r.tasks.count === 0, 'status synthesizes pending tasks once the block is gone (v3.1 §1)')
+    c.dd.forEach((d) => d())
+  }
+
+  // §5 reflow over migrated legacy states (fresh copies, index position)
+  {
+    const c = await reflowCase('migr-v2', {
+      kind: 'docflow', version: 2, dir: '.doc-workflow', objective: 'v2 legacy', doc_roots: ['docs'], stage: 'plan',
+      gates: { understanding: { status: 'answered', asked: true, answered: true }, gaps: { status: 'answered', asked: true, answered: true } },
+      verification: { status: 'passed', lastRun: '2026-01-01T00:00:00.000Z', failed: [], unanchored: [], unattested: [], suspect: [], externals: [] },
+      consistency: { status: 'passed', verdicts: {}, updatedAt: '2026-01-01T00:00:00.000Z' },
+      entries: { U1: { useful: true, title: 't', content: 'c', source_kind: 'doc', source_file: 'docs/api.md', source_quote: 'q', addedAt: 'x' } },
+      pendingDocs: [], plan: {}, createdAt: 'x', updatedAt: 'x',
+    })
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'indexing' })
+    const st = await c.readState()
+    record('R14', r.ok && st.version === 3 && st.stage === 'indexing' && st.verification.status === 'unverified' && st.entries.U1 !== undefined, 'reflow(indexing) on migrated v2 state: migrates then applies, entries preserved')
+    c.dd.forEach((d) => d())
+  }
+  {
+    const c = await reflowCase('migr-v1', {
+      kind: 'docflow', version: 1, dir: '.doc-workflow', objective: 'old objective', doc_roots: ['docs'], stage: 'gaps',
+      gates: { understanding: { status: 'answered', asked: true, answered: true }, gaps: { status: 'open' } },
+      verification: { status: 'passed', lastRun: '2026-01-01T00:00:00.000Z', failed: [], unanchored: ['U1'], unattested: [] },
+      entries: { U1: { useful: true, title: 't', content: 'c', source_file: 'docs/api.md', source_line: 1, addedAt: 'x' } },
+      pendingDocs: [], plan: {}, createdAt: 'x', updatedAt: 'x',
+    })
+    r = await callOn(c.tt, { action: 'reflow', to_stage: 'indexing' })
+    const st = await c.readState()
+    record('R15', r.ok && st.version === 3 && st.stage === 'indexing' && st.verification.status === 'unverified' && st.entries.U1 !== undefined && st.consistency.status === 'n/a', 'reflow(indexing) on migrated v1 state (line-anchor era): entries preserved, verification refreshed')
+    c.dd.forEach((d) => d())
+  }
+
+  // §3 reflow_targets in the status payload at several stages
+  {
+    const c = await reflowCase('targets', doneFixture({ stage: 'consistency' }))
+    r = await callOn(c.tt, { action: 'status' })
+    record('R16a', JSON.stringify(r.reflow_targets) === '["reading","indexing","consistency"]', 'status reflow_targets at consistency')
+    const c2 = await reflowCase('targets2', doneFixture({ stage: 'plan' }))
+    r = await callOn(c2.tt, { action: 'status' })
+    record('R16b', r.reflow_targets.length === 7 && r.reflow_targets.at(-1) === 'plan', 'status reflow_targets at plan = the 7 upstream-or-current steps')
+    c.dd.forEach((d) => d())
+    c2.dd.forEach((d) => d())
+  }
+}
+
 console.log(results.join('\n'))
 console.log('ALL ' + results.length + ' CHECKS PASSED')
 disposers.forEach((d) => d())
