@@ -8,8 +8,13 @@
  * discovery), loads it through the workspaceFiles remote with the same
  * chunked readWholeFile used by the graphify client, and renders the stage
  * machine: objective + stage chips, a derived VERIFIED / VERIFYING /
- * conflict banner (integrity + logical consistency together), the gates
- * rail (understanding / gaps / interview), the INTERVIEW block (delivery
+ * conflict banner (integrity + logical consistency together), the WORKFLOW
+ * rail — steps at or upstream of the current stage are clickable and open an
+ * inline reflow detail (last-run info per step + a "Resume from here" button
+ * that queues a docflow reflow prompt through remote.session; with no
+ * remote.session binding, or when the send fails, the box degrades to the
+ * info rows plus a copyable prompt line — , the gates rail (understanding /
+ * gaps / interview), the INTERVIEW block (delivery
  * chips code/docs with the answer-only badge, role pills, answered
  * timestamp), the ROLE CARDS block (preset status chip none / emitted /
  * skipped / stale, one pill per emitted card, skip-reason line), the
@@ -154,6 +159,19 @@
           'empty.body': 'Start one: ask the agent for a docflow objective.',
           'empty.hint.a': 'or call the ',
           'empty.hint.b': ' tool',
+          'rail': 'Workflow',
+          'reflow.title': 'Step',
+          'reflow.hint': 'Last run info — you can restart the flow from this step',
+          'reflow.resume': 'Resume from here',
+          'reflow.sending': 'sending…',
+          'reflow.sent': 'request sent ✓',
+          'reflow.failed': 'request failed',
+          'reflow.copyHint': 'Copy this line and paste it in the chat.',
+          'reflow.copy': 'copy',
+          'reflow.copied': 'copied ✓',
+          'reflow.noinfo': 'No run info for this step.',
+          'reflow.docs': 'document roots',
+          'reflow.entries': 'entries',
         },
         it: {
           'title': 'Docflow',
@@ -255,6 +273,19 @@
           'empty.body': 'Avviane uno: chiedi all’agente un obiettivo docflow.',
           'empty.hint.a': 'oppure richiama il ',
           'empty.hint.b': ' tool',
+          'rail': 'Flusso',
+          'reflow.title': 'Passo',
+          'reflow.hint': 'Info ultima esecuzione — puoi ripartire da questo passo',
+          'reflow.resume': 'Riparti da qui',
+          'reflow.sending': 'invio…',
+          'reflow.sent': 'richiesta inviata ✓',
+          'reflow.failed': 'invio non riuscito',
+          'reflow.copyHint': 'Copia questa riga e incollala in chat.',
+          'reflow.copy': 'copia',
+          'reflow.copied': 'copiato ✓',
+          'reflow.noinfo': 'Nessuna info di esecuzione per questo passo.',
+          'reflow.docs': 'radici documenti',
+          'reflow.entries': 'voci',
         },
       };
 
@@ -344,6 +375,13 @@
           'text-align:center;color:var(--dsw-alias-label-secondary);}',
         '.dfp-empty b{color:var(--dsw-alias-label-primary);font-size:13.5px;}',
         '.dfp-none{color:var(--dsw-alias-label-tertiary);font-size:11.5px;padding:4px 0;}',
+        '.dfp-stepbtn{font:inherit;font-size:11px;background:none;cursor:pointer;}',
+        '.dfp-stepbtn:hover{border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-interactive-bg-hover);}',
+        '.dfp-step-open{border-color:var(--dsw-alias-brand-primary);}',
+        '.dfp-reflow{margin:-4px 0 12px;}',
+        '.dfp-input{font:inherit;font-size:10.5px;width:100%;box-sizing:border-box;' +
+          'color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);' +
+          'border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:3px 6px;}',
       ].join('\n');
 
       // ---------------------------------------------------------------- helpers
@@ -377,6 +415,29 @@
       var PRESET_CHIP = { 'none': 'dfp-c-neutral', 'emitted': 'dfp-c-success', 'skipped': 'dfp-c-neutral', 'stale': 'dfp-c-warn' };
       var TASK_CHIP = { 'pending': 'dfp-c-neutral', 'emitted': 'dfp-c-success', 'skipped': 'dfp-c-neutral', 'stale': 'dfp-c-warn' };
       var STEPS = ['reading', 'indexing', 'consistency', 'gaps', 'interview', 'presets', 'plan', 'tasks', 'done'];
+
+      // DESIGN-v1.3.1 §1: the legal reflow targets (the rail minus `done`).
+      var REFLOW_TARGETS = ['reading', 'indexing', 'consistency', 'gaps', 'interview', 'presets', 'plan', 'tasks'];
+      /** stagePos per §1: identity for the 8 targets, recheck→indexing, done→99 (all legal), unknown→-1. */
+      function stagePos(s) {
+        if (s === 'done') return 99;
+        if (s === 'recheck') return 1;
+        return REFLOW_TARGETS.indexOf(s);
+      }
+      function stepTitle(id) { return id.charAt(0).toUpperCase() + id.slice(1); }
+      /** §4 TEMPLATE — fixed English, machine-readable for the agent (never localized). */
+      function reflowPromptText(step) {
+        return '[docflow-panel] Reflow requested from step "' + stepTitle(step) +
+          '". Call docflow action=reflow to_stage=' + step +
+          ', tell the user what was kept vs invalidated from the result, and continue from its next guidance.';
+      }
+      var CAN_CLIPBOARD = typeof navigator !== 'undefined' && !!(navigator.clipboard && navigator.clipboard.writeText);
+      /** §1 legality: a step is reflowable when it is a target and at or upstream of the current stage. */
+      function canReflowStep(step, stg) {
+        var ti = REFLOW_TARGETS.indexOf(step);
+        var pos = stagePos(stg);
+        return ti !== -1 && pos !== -1 && ti <= pos;
+      }
 
       /** Read one whole file through the chunked byte window (graphify pattern). */
       async function readWholeFile(remote, sessionId, path, signal) {
@@ -449,7 +510,7 @@
       }
 
       // ------------------------------------------------------------ apply
-      exports.inject = ['slots', 'locale', 'sidebarRightTabs', 'remote', 'remote.workspaceFiles', 'timer'];
+      exports.inject = ['slots', 'locale', 'sidebarRightTabs', 'remote', 'remote.workspaceFiles', 'remote.session', 'timer'];
       exports.apply = function (ctx) {
         var t = ctx.locale.bind(NS);
 
@@ -477,6 +538,13 @@
           var nonce = _nonce[0], setNonce = _nonce[1];
           var _open = React.useState(null);
           var openId = _open[0], setOpenId = _open[1];
+          var _openStep = React.useState(null);
+          var openStep = _openStep[0], setOpenStep = _openStep[1];
+          var _reflow = React.useState(null);   // { step, status: sending|sent|error, atStage, message }
+          var reflow = _reflow[0], setReflow = _reflow[1];
+          var _copied = React.useState(false);
+          var copied = _copied[0], setCopied = _copied[1];
+          var stageRef = React.useRef('');      // live stage, for async-send guards
           var _tick = React.useState(0);
           var tickv = _tick[0], setTickv = _tick[1];
           var ctrlRef = React.useRef(null);
@@ -522,6 +590,8 @@
               lastFileRef.current = file;
               fpRef.current = null;
               readyRef.current = false;
+              setReflow(null);
+              setOpenStep(null);
             }
             var ctrl = new AbortController();
             ctrlRef.current = ctrl;
@@ -558,10 +628,59 @@
             };
           }, [sessionId, found, sel, nonce, tickv]);
 
+          // Once a refresh shows the stage actually moved, the reflow ran:
+          // retire the sent/error marker and close the detail box.
+          React.useEffect(function () {
+            if (!reflow) return;
+            var st = ui.phase === 'ready' ? str((obj(ui.data) || {}).stage) : '';
+            if (st && st !== reflow.atStage) { setReflow(null); setOpenStep(null); }
+          }, [ui.data, ui.phase, reflow]);
+
           function doRefresh() {
             fpRef.current = null;
             readyRef.current = false;
             setNonce(function (n) { return n + 1; });
+          }
+
+          // ---- reflow (panel → chat bridge, DESIGN-v1.3.1 §4) ----
+          function sessionApi() {
+            var s = ctx.remote && ctx.remote.session;
+            return s && typeof s.prompt === 'function' ? s : null;
+          }
+          function toggleStep(step) {
+            setCopied(false);
+            setOpenStep(openStep === step ? null : step);
+          }
+          function doCopy(text) {
+            try {
+              navigator.clipboard.writeText(text).then(
+                function () { setCopied(true); },
+                function () { setCopied(false); });
+            } catch (e) { setCopied(false); }
+          }
+          function sendReflow(step) {
+            var api = sessionApi();
+            if (!api || !sessionId) return;
+            var atStage = stageRef.current;
+            setReflow({ step: step, status: 'sending', atStage: atStage });
+            var rid = 'dfp-reflow-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+            var p;
+            try {
+              p = Promise.resolve(api.prompt({
+                requestId: rid, sessionId: sessionId, mode: 'queue',
+                content: [{ type: 'text', text: reflowPromptText(step) }],
+              }));
+            } catch (err) {
+              setReflow({ step: step, status: 'error', atStage: atStage, message: str((err && err.message) || err) });
+              return;
+            }
+            p.then(function () {
+              if (stageRef.current !== atStage) return; // stage already moved
+              setReflow({ step: step, status: 'sent', atStage: atStage });
+            }, function (err) {
+              if (stageRef.current !== atStage) return;
+              setReflow({ step: step, status: 'error', atStage: atStage, message: str((err && err.message) || err) });
+            });
           }
 
           // ---- small render helpers (defensive against any state shape) ----
@@ -620,6 +739,7 @@
             var curIdx = STEPS.indexOf(stage);
             var recheck = stage === 'recheck';
             if (recheck) curIdx = 1;
+            var pos = stagePos(stage);
             var kids = [];
             for (var i = 0; i < STEPS.length; i++) {
               var step = STEPS[i];
@@ -628,10 +748,170 @@
               if (recheck && i === 1) { cls += ' dfp-step-warn'; label = stageLabel('recheck'); }
               else if (i === curIdx) cls += ' dfp-step-cur';
               else if (curIdx !== -1 && i < curIdx) cls += ' dfp-step-done';
+              var clickable = i < REFLOW_TARGETS.length && pos !== -1 && i <= pos;
+              if (clickable && openStep === step) cls += ' dfp-step-open';
               if (i > 0) kids.push(React.createElement('span', { key: 's' + i, class: 'dfp-sep' }, '→'));
-              kids.push(React.createElement('span', { key: step, class: cls }, label));
+              kids.push(clickable
+                ? React.createElement('button', {
+                  key: step, type: 'button', class: cls + ' dfp-stepbtn',
+                  title: t('reflow.hint'), onClick: toggleStep.bind(null, step),
+                }, label)
+                : React.createElement('span', { key: step, class: cls }, label));
             }
             return React.createElement('div', { class: 'dfp-rail' }, kids);
+          }
+
+          // Last-run info rows for the reflow detail (§4 table). Every field is
+          // optional: a missing one simply drops its row — never "?", never a
+          // crash, on v2 / v3.0 / v3.1 partial states.
+          function reflowInfo(S, step) {
+            var rows = [];
+            function row(label, nodes) {
+              var kids = [React.createElement('span', { key: 'l', class: 'dfp-lbl' }, label)];
+              var n = 0;
+              for (var k = 0; k < nodes.length; k++) {
+                if (nodes[k]) { kids.push(React.createElement(React.Fragment, { key: 'n' + k }, nodes[k])); n++; }
+              }
+              if (n) rows.push(React.createElement('div', { key: 'r' + rows.length, class: 'dfp-row' }, kids));
+            }
+            function pill(s) { return React.createElement('span', { class: 'dfp-pill' }, s); }
+            function meta(s) { return React.createElement('span', { class: 'dfp-meta' }, s); }
+            var j;
+            if (step === 'reading') {
+              var ob = str(S.objective);
+              row(t('objective'), [ob ? React.createElement('span', { class: 'dfp-v' }, midTruncate(ob, 140)) : null]);
+              var dr = arr(S.doc_roots !== undefined ? S.doc_roots : S.docRoots);
+              row(t('reflow.docs'), [dr.length ? pill(String(dr.length)) : null]);
+            } else if (step === 'indexing') {
+              var ents = obj(S.entries) || {}, nu = 0, nn = 0;
+              Object.keys(ents).forEach(function (kk) { var e = obj(ents[kk]); if (!e) return; if (e.useful) nu++; else nn++; });
+              row(t('reflow.entries'), [pill(nu + ' U / ' + nn + ' N')]);
+              var v = obj(S.verification);
+              if (v) {
+                var vs = known(VER_STATUS, str(v.status)) ? str(v.status) : 'unverified';
+                var vlr = str(v.lastRun || v.last_run);
+                row(t('verification'), [
+                  chip(vs === 'passed' ? t('ver.passed') : t('ver.' + vs), VER_CHIP[vs] || 'dfp-c-neutral'),
+                  vlr ? meta(t('ver.last') + ' ' + fmtTime(vlr)) : null]);
+              }
+            } else if (step === 'consistency') {
+              var ci = consInfo(S);
+              row(t('consistency'), [
+                chip(ci.cs === 'n/a' ? t('c.na') : t('c.' + ci.cs), CONS_CHIP[ci.cs] || 'dfp-c-neutral'),
+                ci.total > 0 ? meta(Math.min(ci.done, ci.total) + '/' + ci.total + ' ' + t('c.pairs')) : null]);
+              if (ci.conflicts.length) {
+                var cp = [];
+                for (j = 0; j < ci.conflicts.length; j++) {
+                  cp.push(React.createElement('span', {
+                    class: 'dfp-pill dfp-pill-error', title: ci.conflicts[j].note || undefined,
+                  }, ci.conflicts[j].key));
+                }
+                row(t('c.conflicts'), cp);
+              }
+            } else if (step === 'gaps') {
+              var g = obj((obj(S.gates) || {}).gaps);
+              if (g) {
+                var gs = known(GATE_STATUS, str(g.status)) ? str(g.status) : 'locked';
+                var gat = str(g.answeredAt || g.answered_at);
+                var gak = str(g.askedAt || g.asked_at);
+                row(t('gate.gaps'), [
+                  chip(gs === 'locked' ? t('gate.locked') : t('gate.' + gs), GATE_CHIP[gs] || 'dfp-c-neutral'),
+                  gat ? meta(t('gate.answered') + ' ' + fmtTime(gat)) : (gak ? meta(t('gate.asked') + ' ' + fmtTime(gak)) : null),
+                  g.reconfirm ? React.createElement('span', { class: 'dfp-warnbadge' }, t('gate.reconfirm')) : null]);
+              }
+            } else if (step === 'interview') {
+              var iv = obj(S.interview) || {};
+              var ivNodes = [];
+              if (iv.answerOnly === true || iv.answer_only === true) ivNodes.push(chip(t('interview.answerOnly'), 'dfp-c-warn'));
+              var dl = arr(iv.delivery);
+              for (j = 0; j < dl.length; j++) {
+                var dv = str(dl[j]);
+                ivNodes.push(chip(known(DELIVERY_KINDS, dv) ? t('interview.d.' + dv) : dv, 'dfp-c-brand'));
+              }
+              var ivAt = str(iv.answeredAt || iv.answered_at);
+              if (ivAt) ivNodes.push(meta(t('interview.answered') + ' ' + fmtTime(ivAt)));
+              row(t('interview'), ivNodes);
+              var rls = arr(iv.roles), rp = [];
+              for (j = 0; j < rls.length; j++) rp.push(pill(str(rls[j])));
+              row(t('interview.roles'), rp);
+            } else if (step === 'presets') {
+              var pr = obj(S.presets);
+              if (pr) {
+                var ps = known(PRESET_STATUS, str(pr.status)) ? str(pr.status) : 'none';
+                var pem = str(pr.emittedAt || pr.emitted_at);
+                var psk = str(pr.skipReason || pr.skip_reason);
+                row(t('presets'), [
+                  chip(t('preset.' + ps), PRESET_CHIP[ps] || 'dfp-c-neutral'),
+                  pem ? meta(fmtTime(pem)) : null,
+                  (ps === 'skipped' && psk) ? React.createElement('span', { class: 'dfp-none' }, psk) : null]);
+                var cards = arr(pr.cards), prl = [];
+                for (j = 0; j < cards.length; j++) {
+                  var card = obj(cards[j]);
+                  if (card && str(card.role)) prl.push(pill(str(card.role)));
+                }
+                row(t('interview.roles'), prl);
+              }
+            } else if (step === 'plan') {
+              var pl = obj(S.plan);
+              var wat = pl ? str(pl.writtenAt || pl.written_at) : '';
+              row(t('plan'), [wat ? React.createElement('span', null,
+                chip(t('plan.written'), 'dfp-c-success'), ' ', meta(fmtTime(wat))) : null]);
+            } else if (step === 'tasks') {
+              var tk = obj(S.tasks);
+              if (tk) {
+                var ts = known(TASK_STATUS, str(tk.status)) ? str(tk.status) : 'pending';
+                if (ts === 'emitted' && tk.stale === true) ts = 'stale';
+                var tem = str(tk.emittedAt || tk.emitted_at);
+                var tsk = str(tk.skipReason || tk.skip_reason);
+                var tcount = arr(tk.items).length;
+                row(t('tasks'), [
+                  chip(t('task.' + ts), TASK_CHIP[ts] || 'dfp-c-neutral'),
+                  tem ? meta(fmtTime(tem)) : null,
+                  tcount ? pill(String(tcount)) : null,
+                  (ts === 'skipped' && tsk) ? React.createElement('span', { class: 'dfp-none' }, tsk) : null]);
+              }
+            }
+            return rows;
+          }
+
+          // Inline reflow detail: info rows + primary auto-restart button, or
+          // — on send failure — the template in a selectable read-only input
+          // (plus clipboard when available) so the user can paste it manually.
+          function renderReflowBox(S, step) {
+            var api = sessionApi();
+            var r = reflow && reflow.step === step ? reflow : null;
+            var kids = [];
+            kids.push(React.createElement('div', { key: 'h', class: 'dfp-k' }, t('reflow.title') + ' · ' + stageLabel(step)));
+            var info = reflowInfo(S, step);
+            for (var i = 0; i < info.length; i++) kids.push(React.createElement(React.Fragment, { key: 'i' + i }, info[i]));
+            if (!info.length) kids.push(React.createElement('div', { key: 'n', class: 'dfp-none' }, t('reflow.noinfo')));
+            if (api && sessionId) {
+              var sending = !!(r && r.status === 'sending');
+              var sent = !!(r && r.status === 'sent');
+              kids.push(React.createElement('div', { key: 'act', class: 'dfp-row' },
+                React.createElement('button', {
+                  key: 'b', class: 'dfp-btn', type: 'button', disabled: sending || sent,
+                  onClick: function () { sendReflow(step); },
+                }, sending ? t('reflow.sending') : t('reflow.resume')),
+                sent ? React.createElement('span', { key: 'ok', class: 'dfp-chip dfp-c-success' }, t('reflow.sent')) : null,
+                (r && r.status === 'error') ? React.createElement('span', {
+                  key: 'e', class: 'dfp-warnbadge', title: r.message || undefined,
+                }, t('reflow.failed')) : null));
+              if (r && r.status === 'error') {
+                var ptxt = reflowPromptText(step);
+                kids.push(React.createElement('div', { key: 'fb', class: 'dfp-row' }, React.createElement('input', {
+                  class: 'dfp-input', type: 'text', readOnly: true, value: ptxt,
+                  onFocus: function (ev) { if (ev.target.select) { try { ev.target.select(); } catch (e) { /* ignore */ } } },
+                })));
+                kids.push(React.createElement('div', { key: 'hint', class: 'dfp-row' },
+                  CAN_CLIPBOARD ? React.createElement('button', {
+                    class: 'dfp-btn', type: 'button', onClick: doCopy.bind(null, ptxt),
+                  }, copied ? t('reflow.copied') : t('reflow.copy')) : null,
+                  React.createElement('span', { class: 'dfp-none' },
+                    (r.message ? r.message + ' — ' : '') + t('reflow.copyHint'))));
+              }
+            }
+            return React.createElement('div', { key: 'box', class: 'dfp-detail dfp-reflow' }, kids);
           }
 
           function gateRow(label, g) {
@@ -944,6 +1224,7 @@
           // ---- render ----
           var S = ui.phase === 'ready' ? (obj(ui.data) || {}) : null;
           var stage = S ? str(S.stage) : '';
+          stageRef.current = stage;
 
           return React.createElement('div', { class: 'dfp-root' },
             React.createElement('style', null, CSS),
@@ -951,7 +1232,7 @@
               React.createElement('span', { class: 'dfp-title' }, t('title')),
               found.length > 1 ? React.createElement('select', {
                 class: 'dfp-sel', value: Math.min(sel, found.length - 1),
-                onChange: function (ev) { setSel(+ev.target.value); setOpenId(null); },
+                onChange: function (ev) { setSel(+ev.target.value); setOpenId(null); setOpenStep(null); setReflow(null); setCopied(false); },
               }, found.map(function (p, i) {
                 return React.createElement('option', { key: i, value: i }, projectLabel(p));
               })) : null,
@@ -981,7 +1262,9 @@
               React.createElement('div', { class: 'dfp-row' },
                 chip(stageLabel(stage), STAGE_CHIP[stage] || 'dfp-c-neutral'),
                 verifyBanner(S)),
+              sectionHead(t('rail')),
               renderRail(S),
+              (openStep && canReflowStep(openStep, stage) ? renderReflowBox(S, openStep) : null),
               renderGates(S),
               renderInterview(S),
               renderPresets(S),
