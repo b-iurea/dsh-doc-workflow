@@ -7,9 +7,13 @@
  * (root `.doc-workflow/` or one level down per project, like graphify's
  * discovery), loads it through the workspaceFiles remote with the same
  * chunked readWholeFile used by the graphify client, and renders the stage
- * machine: objective + stage chips, the gates rail (understanding / gaps),
- * verification results with per-entry pills, the useful / non-useful entry
- * index with expandable details, pending new documents and the plan block.
+ * machine: objective + stage chips, a derived VERIFIED / VERIFYING /
+ * conflict banner (integrity + logical consistency together), the gates
+ * rail (understanding / gaps), verification results with per-entry pills
+ * (failed / unanchored / unattested / suspect / external sources), the
+ * useful / non-useful entry index with expandable details — external
+ * sources carry an 'ext' badge since only a human can check them —,
+ * pending new documents and the plan block.
  *
  * A ctx.timer interval re-stats the selected state file every 7 s and
  * reloads only when its version/bytes changed, so the panel follows the
@@ -56,6 +60,7 @@
           'updated': 'updated',
           'stage.reading': 'Reading',
           'stage.indexing': 'Indexing',
+          'stage.consistency': 'Consistency',
           'stage.extract': 'Extract',
           'stage.verify': 'Verify',
           'stage.recheck': 'Re-check',
@@ -83,6 +88,22 @@
           'v.unanchored': 'unanchored',
           'v.unattested': 'unattested',
           'v.suspect': 'suspect',
+          'v.externals': 'external sources',
+          'consistency': 'Logical consistency',
+          'banner.verified': 'Verified',
+          'banner.cons.pending': 'Integrity ok — logical consistency pending',
+          'banner.conflict.a': 'Consistency: ',
+          'banner.conflict.b': ' conflict(s) — re-check marked pairs',
+          'banner.notverified': 'Verification not run / stale — data not verified',
+          'status.verified': 'VERIFIED',
+          'status.verifying': 'VERIFYING',
+          'c.na': 'n/a',
+          'c.pending': 'pending',
+          'c.conflict': 'conflict',
+          'c.passed': 'passed',
+          'c.pairs': 'pairs',
+          'c.conflicts': 'conflicting pairs',
+          'entry.external': 'external source (to check)',
           'entries': 'Entries',
           'entries.useful': 'Useful',
           'entries.notuseful': 'Non-useful',
@@ -117,6 +138,7 @@
           'updated': 'aggiornato',
           'stage.reading': 'Lettura',
           'stage.indexing': 'Indicizzazione',
+          'stage.consistency': 'Coerenza logica',
           'stage.extract': 'Estrazione',
           'stage.verify': 'Verifica',
           'stage.recheck': 'Ricontrollo',
@@ -144,6 +166,22 @@
           'v.unanchored': 'senza àncora',
           'v.unattested': 'non attestati',
           'v.suspect': 'sospetti',
+          'v.externals': 'fonti esterne',
+          'consistency': 'Coerenza logica',
+          'banner.verified': 'Verificato',
+          'banner.cons.pending': 'Integrità ok — coerenza logica in sospeso',
+          'banner.conflict.a': 'Coerenza: ',
+          'banner.conflict.b': ' conflitto/i — ricontrolla le coppie segnate',
+          'banner.notverified': 'Verifica non eseguita / obsoleta — dati non verificati',
+          'status.verified': 'VERIFICATO',
+          'status.verifying': 'IN VERIFICA',
+          'c.na': 'n/a',
+          'c.pending': 'in sospeso',
+          'c.conflict': 'in conflitto',
+          'c.passed': 'coerente',
+          'c.pairs': 'coppie',
+          'c.conflicts': 'coppie in conflitto',
+          'entry.external': 'fonte esterna (da controllare)',
           'entries': 'Voci',
           'entries.useful': 'Utili',
           'entries.notuseful': 'Non utili',
@@ -235,7 +273,10 @@
         '.dfp-v{overflow-wrap:anywhere;white-space:pre-wrap;}',
         '.dfp-quote{border-left:2px solid var(--dsw-alias-border-l2);padding-left:8px;margin:2px 0;' +
           'color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;' +
-          'max-height:160px;overflow-y:auto;font-size:11.5px;}',
+          'max-height:160px;overflow-y:auto;font-size:11.5px;font-style:italic;}',
+        '.dfp-ext{flex:none;font-size:9.5px;line-height:14px;padding:0 4px;border-radius:4px;' +
+          'border:1px solid var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-state-warn-primary);' +
+          'white-space:nowrap;}',
         '.dfp-code{font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;' +
           'background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1);' +
           'border-radius:4px;padding:0 4px;}',
@@ -267,13 +308,15 @@
         return s.slice(0, max - tail - 1) + '…' + s.slice(s.length - tail);
       }
       function known(table, name) { return table[name] ? true : false; }
-      var STAGE_NAMES = { 'reading': 1, 'indexing': 1, 'extract': 1, 'verify': 1, 'recheck': 1, 'gaps': 1, 'plan': 1, 'done': 1, 'no-workflow': 1 };
+      var STAGE_NAMES = { 'reading': 1, 'indexing': 1, 'consistency': 1, 'extract': 1, 'verify': 1, 'recheck': 1, 'gaps': 1, 'plan': 1, 'done': 1, 'no-workflow': 1 };
       var GATE_STATUS = { 'locked': 1, 'open': 1, 'asked': 1, 'pending': 1, 'answered': 1 };
       var VER_STATUS = { 'unverified': 1, 'stale': 1, 'passed': 1, 'failed': 1 };
-      var STAGE_CHIP = { 'reading': 'dfp-c-neutral', 'indexing': 'dfp-c-neutral', 'recheck': 'dfp-c-warn', 'gaps': 'dfp-c-brand', 'plan': 'dfp-c-brand', 'done': 'dfp-c-success' };
+      var CONS_STATUS = { 'n/a': 1, 'passed': 1, 'pending': 1, 'conflict': 1 };
+      var STAGE_CHIP = { 'reading': 'dfp-c-neutral', 'indexing': 'dfp-c-neutral', 'consistency': 'dfp-c-brand', 'recheck': 'dfp-c-warn', 'gaps': 'dfp-c-brand', 'plan': 'dfp-c-brand', 'done': 'dfp-c-success' };
       var VER_CHIP = { 'unverified': 'dfp-c-neutral', 'stale': 'dfp-c-warn', 'passed': 'dfp-c-success', 'failed': 'dfp-c-error' };
       var GATE_CHIP = { 'locked': 'dfp-c-neutral', 'open': 'dfp-c-brand', 'asked': 'dfp-c-warn', 'pending': 'dfp-c-warn', 'answered': 'dfp-c-success' };
-      var STEPS = ['reading', 'indexing', 'gaps', 'plan', 'done'];
+      var CONS_CHIP = { 'n/a': 'dfp-c-neutral', 'passed': 'dfp-c-success', 'pending': 'dfp-c-warn', 'conflict': 'dfp-c-error' };
+      var STEPS = ['reading', 'indexing', 'consistency', 'gaps', 'plan', 'done'];
 
       /** Read one whole file through the chunked byte window (graphify pattern). */
       async function readWholeFile(remote, sessionId, path, signal) {
@@ -472,10 +515,39 @@
             return known(STAGE_NAMES, s) ? t('stage.' + s) : (s || '—');
           }
           function sourceOf(e) {
+            if (str(e.source_kind) === 'external') return str(e.source_ref);
             var f = str(e.source_file);
             var l = e.source_line;
             if (l != null && l !== '' && !isNaN(Number(l))) f = f + ':' + Number(l);
             return f;
+          }
+          function consInfo(S) {
+            var c = obj(S.consistency) || {};
+            var cs = known(CONS_STATUS, str(c.status)) ? str(c.status) : 'n/a';
+            var verdicts = obj(c.verdicts) || {};
+            var vk = Object.keys(verdicts).sort();
+            var conflicts = [];
+            for (var i = 0; i < vk.length; i++) {
+              var vd = obj(verdicts[vk[i]]);
+              if (vd && str(vd.verdict) === 'conflict') conflicts.push({ key: vk[i], note: str(vd.note) });
+            }
+            var entries = obj(S.entries) || {};
+            var u = 0;
+            Object.keys(entries).forEach(function (k) { var e = obj(entries[k]); if (e && e.useful) u++; });
+            return { cs: cs, conflicts: conflicts, done: vk.length, total: u * (u - 1) / 2 };
+          }
+          function verifyBanner(S) {
+            var vst = str((obj(S.verification) || {}).status) || 'unverified';
+            var ci = consInfo(S);
+            if (ci.cs === 'conflict') {
+              return chip(t('banner.conflict.a') + ci.conflicts.length + t('banner.conflict.b'), 'dfp-c-error');
+            }
+            if (vst === 'passed' && ci.cs === 'pending') return chip(t('banner.cons.pending'), 'dfp-c-warn');
+            if (vst === 'passed' && (ci.cs === 'passed' || ci.cs === 'n/a')) return chip(t('banner.verified'), 'dfp-c-success');
+            if ((vst === 'stale' || vst === 'unverified') && Object.keys(obj(S.entries) || {}).length > 0) {
+              return chip(t('banner.notverified'), 'dfp-c-neutral');
+            }
+            return null;
           }
           function dot(cls, titleText) {
             return React.createElement('span', { class: 'dfp-dot ' + cls, title: titleText });
@@ -538,17 +610,40 @@
             var v = obj(S.verification) || {};
             var status = str(v.status) || 'unverified';
             if (!known(VER_STATUS, status)) status = 'unverified';
+            var ci = consInfo(S);
+            var overallOk = status === 'passed' && (ci.cs === 'passed' || ci.cs === 'n/a');
+            var verifying = status === 'passed' && ci.cs === 'pending';
             var failed = arr(v.failed), unanchored = arr(v.unanchored), unattested = arr(v.unattested), suspect = arr(v.suspect);
+            var externals = arr(v.externals);
+            var consLabel = ci.cs === 'n/a' ? t('c.na') : t('c.' + ci.cs);
+            var kids = [
+              React.createElement('div', { key: 'top', class: 'dfp-row' },
+                chip(status === 'passed' ? t('ver.passed') : t('ver.' + status), VER_CHIP[status] || 'dfp-c-neutral'),
+                overallOk ? chip(t('status.verified'), 'dfp-c-success') : null,
+                verifying ? chip(t('status.verifying'), 'dfp-c-warn') : null,
+                str(v.lastRun) ? React.createElement('span', { class: 'dfp-meta' }, t('ver.last') + ' ' + fmtTime(v.lastRun)) : null),
+              React.createElement('div', { key: 'cons', class: 'dfp-row' },
+                React.createElement('span', { class: 'dfp-lbl' }, t('consistency')),
+                chip(consLabel, CONS_CHIP[ci.cs] || 'dfp-c-neutral'),
+                ci.total > 0 ? React.createElement('span', { class: 'dfp-meta' },
+                  Math.min(ci.done, ci.total) + '/' + ci.total + ' ' + t('c.pairs')) : null),
+              failed.length ? pillRow(t('v.failed'), failed, 'dfp-pill-error') : null,
+              unanchored.length ? pillRow(t('v.unanchored'), unanchored, 'dfp-pill-warn') : null,
+              unattested.length ? pillRow(t('v.unattested'), unattested, '') : null,
+              suspect.length ? pillRow(t('v.suspect'), suspect, 'dfp-pill-warn') : null,
+              externals.length ? pillRow(t('v.externals'), externals, '') : null];
+            if (ci.conflicts.length) {
+              var ck = [React.createElement('span', { key: 'l', class: 'dfp-lbl' }, t('c.conflicts'))];
+              for (var q = 0; q < ci.conflicts.length; q++) {
+                ck.push(React.createElement('span', {
+                  key: 'cx' + q, class: 'dfp-pill dfp-pill-error', title: ci.conflicts[q].note,
+                }, ci.conflicts[q].key));
+              }
+              kids.push(React.createElement('div', { key: 'cfr', class: 'dfp-row' }, ck));
+            }
             return React.createElement('div', null,
               sectionHead(t('verification')),
-              React.createElement('div', { class: 'dfp-box' },
-                React.createElement('div', { class: 'dfp-row' },
-                  chip(status === 'passed' ? t('ver.passed') : t('ver.' + status), VER_CHIP[status] || 'dfp-c-neutral'),
-                  str(v.lastRun) ? React.createElement('span', { class: 'dfp-meta' }, t('ver.last') + ' ' + fmtTime(v.lastRun)) : null),
-                failed.length ? pillRow(t('v.failed'), failed, 'dfp-pill-error') : null,
-                unanchored.length ? pillRow(t('v.unanchored'), unanchored, 'dfp-pill-warn') : null,
-                unattested.length ? pillRow(t('v.unattested'), unattested, '') : null,
-                suspect.length ? pillRow(t('v.suspect'), suspect, 'dfp-pill-warn') : null));
+              React.createElement('div', { class: 'dfp-box' }, kids));
           }
 
           function entryDetail(e) {
@@ -589,6 +684,7 @@
             var kids = [
               React.createElement('span', { key: 'id', class: 'dfp-id ' + (e.useful ? 'dfp-id-u' : 'dfp-id-n') }, id),
               React.createElement('span', { key: 'ti', class: 'dfp-etitle', title: str(e.title) }, str(e.title) || '—'),
+              str(e.source_kind) === 'external' ? React.createElement('span', { key: 'ex', class: 'dfp-ext', title: t('entry.external') }, 'ext') : null,
               src ? React.createElement('span', { key: 'sr', class: 'dfp-src', title: src }, midTruncate(src, 36)) : null,
               vDot, aDot];
             return React.createElement('div', { key: id },
@@ -698,7 +794,8 @@
               React.createElement('div', { class: 'dfp-obj', title: str(S.objective) },
                 str(S.objective) ? t('objective') + ': ' + str(S.objective) : null),
               React.createElement('div', { class: 'dfp-row' },
-                chip(stageLabel(stage), STAGE_CHIP[stage] || 'dfp-c-neutral')),
+                chip(stageLabel(stage), STAGE_CHIP[stage] || 'dfp-c-neutral'),
+                verifyBanner(S)),
               renderRail(S),
               renderGates(S),
               renderVerification(S),
