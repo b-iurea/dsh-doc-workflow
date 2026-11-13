@@ -1,8 +1,13 @@
 {
   "name": "@local/doc-workflow",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "check": "node --check index.js && node --check client.js && node --check test/e2e.mjs",
+    "test": "cd test && node e2e.mjs"
+  },
   "description": "Document-driven workflow: objective, verified index.md, clarification gates, notes and plan.",
   "exports": {
     ".": "./index.js",

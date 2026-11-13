@@ -9,11 +9,16 @@
  * chunked readWholeFile used by the graphify client, and renders the stage
  * machine: objective + stage chips, a derived VERIFIED / VERIFYING /
  * conflict banner (integrity + logical consistency together), the gates
- * rail (understanding / gaps), verification results with per-entry pills
- * (failed / unanchored / unattested / suspect / external sources), the
- * useful / non-useful entry index with expandable details — external
- * sources carry an 'ext' badge since only a human can check them —,
- * pending new documents and the plan block.
+ * rail (understanding / gaps / interview), the INTERVIEW block (delivery
+ * chips code/docs with the answer-only badge, role pills, answered
+ * timestamp), the ROLE CARDS block (preset status chip none / emitted /
+ * skipped / stale, one pill per emitted card, skip-reason line),
+ * verification results with per-entry pills (failed / unanchored /
+ * unattested / suspect / external sources), the useful / non-useful entry
+ * index with expandable details — external sources carry an 'ext' badge
+ * since only a human can check them —, pending new documents and the plan
+ * block. v2 state files without the interview / presets fields degrade to
+ * locked / hidden sections, never a crash.
  *
  * A ctx.timer interval re-stats the selected state file every 7 s and
  * reloads only when its version/bytes changed, so the panel follows the
@@ -65,12 +70,15 @@
           'stage.verify': 'Verify',
           'stage.recheck': 'Re-check',
           'stage.gaps': 'Gaps',
+          'stage.interview': 'Interview',
+          'stage.presets': 'Role cards',
           'stage.plan': 'Plan',
           'stage.done': 'Done',
           'stage.no-workflow': 'No workflow',
           'gates': 'Gates',
           'gate.understanding': 'Understanding',
           'gate.gaps': 'Missing information',
+          'gate.interview': 'Interview',
           'gate.locked': 'locked',
           'gate.open': 'open',
           'gate.asked': 'asked',
@@ -78,6 +86,18 @@
           'gate.answered': 'answered',
           'gate.reconfirm': '⚠ reconfirm with user',
           'gate.answers': 'answers',
+          'interview': 'Interview',
+          'interview.delivery': 'Delivery',
+          'interview.d.code': 'code',
+          'interview.d.docs': 'docs',
+          'interview.answerOnly': 'answer only',
+          'interview.roles': 'Roles',
+          'interview.answered': 'answered',
+          'presets': 'Role cards',
+          'preset.none': 'no cards',
+          'preset.emitted': 'emitted',
+          'preset.skipped': 'skipped',
+          'preset.stale': 'stale',
           'verification': 'Verification',
           'ver.unverified': 'unverified',
           'ver.stale': 'stale',
@@ -143,12 +163,15 @@
           'stage.verify': 'Verifica',
           'stage.recheck': 'Ricontrollo',
           'stage.gaps': 'Lacune',
+          'stage.interview': 'Colloquio',
+          'stage.presets': 'Schede ruolo',
           'stage.plan': 'Piano',
           'stage.done': 'Fatto',
           'stage.no-workflow': 'Nessun workflow',
           'gates': 'Soglie',
           'gate.understanding': 'Comprensione',
           'gate.gaps': 'Informazioni mancanti',
+          'gate.interview': 'Colloquio',
           'gate.locked': 'bloccata',
           'gate.open': 'aperta',
           'gate.asked': 'chiesta',
@@ -156,6 +179,18 @@
           'gate.answered': 'risposta ricevuta',
           'gate.reconfirm': '⚠ da riconfermare',
           'gate.answers': 'risposte',
+          'interview': 'Colloquio',
+          'interview.delivery': 'Consegna',
+          'interview.d.code': 'code',
+          'interview.d.docs': 'documenti',
+          'interview.answerOnly': 'solo risposta',
+          'interview.roles': 'Ruoli',
+          'interview.answered': 'risposto',
+          'presets': 'Schede ruolo',
+          'preset.none': 'nessuna scheda',
+          'preset.emitted': 'emesse',
+          'preset.skipped': 'omesse',
+          'preset.stale': 'da rifare',
           'verification': 'Verifica',
           'ver.unverified': 'non verificata',
           'ver.stale': 'da rifare',
@@ -308,15 +343,18 @@
         return s.slice(0, max - tail - 1) + '…' + s.slice(s.length - tail);
       }
       function known(table, name) { return table[name] ? true : false; }
-      var STAGE_NAMES = { 'reading': 1, 'indexing': 1, 'consistency': 1, 'extract': 1, 'verify': 1, 'recheck': 1, 'gaps': 1, 'plan': 1, 'done': 1, 'no-workflow': 1 };
+      var STAGE_NAMES = { 'reading': 1, 'indexing': 1, 'consistency': 1, 'extract': 1, 'verify': 1, 'recheck': 1, 'gaps': 1, 'interview': 1, 'presets': 1, 'plan': 1, 'done': 1, 'no-workflow': 1 };
       var GATE_STATUS = { 'locked': 1, 'open': 1, 'asked': 1, 'pending': 1, 'answered': 1 };
       var VER_STATUS = { 'unverified': 1, 'stale': 1, 'passed': 1, 'failed': 1 };
       var CONS_STATUS = { 'n/a': 1, 'passed': 1, 'pending': 1, 'conflict': 1 };
-      var STAGE_CHIP = { 'reading': 'dfp-c-neutral', 'indexing': 'dfp-c-neutral', 'consistency': 'dfp-c-brand', 'recheck': 'dfp-c-warn', 'gaps': 'dfp-c-brand', 'plan': 'dfp-c-brand', 'done': 'dfp-c-success' };
+      var PRESET_STATUS = { 'none': 1, 'emitted': 1, 'skipped': 1, 'stale': 1 };
+      var DELIVERY_KINDS = { 'code': 1, 'docs': 1 };
+      var STAGE_CHIP = { 'reading': 'dfp-c-neutral', 'indexing': 'dfp-c-neutral', 'consistency': 'dfp-c-brand', 'recheck': 'dfp-c-warn', 'gaps': 'dfp-c-brand', 'interview': 'dfp-c-brand', 'presets': 'dfp-c-brand', 'plan': 'dfp-c-brand', 'done': 'dfp-c-success' };
       var VER_CHIP = { 'unverified': 'dfp-c-neutral', 'stale': 'dfp-c-warn', 'passed': 'dfp-c-success', 'failed': 'dfp-c-error' };
       var GATE_CHIP = { 'locked': 'dfp-c-neutral', 'open': 'dfp-c-brand', 'asked': 'dfp-c-warn', 'pending': 'dfp-c-warn', 'answered': 'dfp-c-success' };
       var CONS_CHIP = { 'n/a': 'dfp-c-neutral', 'passed': 'dfp-c-success', 'pending': 'dfp-c-warn', 'conflict': 'dfp-c-error' };
-      var STEPS = ['reading', 'indexing', 'consistency', 'gaps', 'plan', 'done'];
+      var PRESET_CHIP = { 'none': 'dfp-c-neutral', 'emitted': 'dfp-c-success', 'skipped': 'dfp-c-neutral', 'stale': 'dfp-c-warn' };
+      var STEPS = ['reading', 'indexing', 'consistency', 'gaps', 'interview', 'presets', 'plan', 'done'];
 
       /** Read one whole file through the chunked byte window (graphify pattern). */
       async function readWholeFile(remote, sessionId, path, signal) {
@@ -595,7 +633,77 @@
               sectionHead(t('gates')),
               React.createElement('div', { class: 'dfp-box' },
                 gateRow(t('gate.understanding'), obj(gates.understanding)),
-                gateRow(t('gate.gaps'), obj(gates.gaps))));
+                gateRow(t('gate.gaps'), obj(gates.gaps)),
+                gateRow(t('gate.interview'), obj(gates.interview))));
+          }
+
+          // Interview block: only once the interview gate has been reached and
+          // answered — v2 states (field absent) and v3 shells ({}) render nothing.
+          function renderInterview(S) {
+            var iv = obj(S.interview) || {};
+            var delivery = arr(iv.delivery);
+            var roles = arr(iv.roles);
+            var answerOnly = iv.answerOnly === true;
+            var answered = str(iv.answeredAt);
+            if (!answerOnly && !answered && delivery.length === 0 && roles.length === 0) return null;
+            var dRow = [React.createElement('span', { key: 'l', class: 'dfp-lbl' }, t('interview.delivery'))];
+            for (var i = 0; i < delivery.length; i++) {
+              var dv = str(delivery[i]);
+              dRow.push(React.createElement('span', { key: 'd' + i, class: 'dfp-chip dfp-c-brand' },
+                known(DELIVERY_KINDS, dv) ? t('interview.d.' + dv) : dv));
+            }
+            if (answerOnly) {
+              dRow.push(React.createElement('span', { key: 'ao', class: 'dfp-chip dfp-c-warn' }, t('interview.answerOnly')));
+            }
+            if (answered) {
+              dRow.push(React.createElement('span', { key: 'at', class: 'dfp-meta' }, t('interview.answered') + ' ' + fmtTime(answered)));
+            }
+            var kids = [React.createElement('div', { key: 'del', class: 'dfp-row' }, dRow)];
+            if (roles.length) {
+              var rRow = [React.createElement('span', { key: 'l', class: 'dfp-lbl' }, t('interview.roles'))];
+              for (var r = 0; r < roles.length; r++) {
+                rRow.push(React.createElement('span', { key: 'r' + r, class: 'dfp-pill' }, str(roles[r])));
+              }
+              kids.push(React.createElement('div', { key: 'rol', class: 'dfp-row' }, rRow));
+            }
+            return React.createElement('div', null,
+              sectionHead(t('interview')),
+              React.createElement('div', { class: 'dfp-box' }, kids));
+          }
+
+          // Role-cards block: presets status chip + one pill per card. The
+          // whole section is hidden when the field is absent (v2 states).
+          function renderPresets(S) {
+            var pr = obj(S.presets);
+            if (!pr) return null;
+            var status = known(PRESET_STATUS, str(pr.status)) ? str(pr.status) : 'none';
+            var cards = arr(pr.cards);
+            var top = [React.createElement('span', {
+              key: 'st', class: 'dfp-chip ' + (PRESET_CHIP[status] || 'dfp-c-neutral'),
+            }, t('preset.' + status))];
+            if (status === 'emitted' && str(pr.emittedAt)) {
+              top.push(React.createElement('span', { key: 'at', class: 'dfp-meta' }, fmtTime(pr.emittedAt)));
+            }
+            var kids = [React.createElement('div', { key: 'top', class: 'dfp-row' }, top)];
+            if (status === 'skipped' && str(pr.skipReason)) {
+              kids.push(React.createElement('div', { key: 'skip', class: 'dfp-row' },
+                React.createElement('span', { class: 'dfp-none' }, str(pr.skipReason))));
+            }
+            var row = [];
+            for (var i = 0; i < cards.length; i++) {
+              var c = obj(cards[i]);
+              if (!c) continue;
+              var why = str(c.why);
+              var se = arr(c.source_entries).map(str).filter(function (x) { return x !== ''; });
+              row.push(React.createElement('span', {
+                key: 'c' + i, class: 'dfp-pill',
+                title: (why ? why + ' — ' : '') + se.join(', '),
+              }, str(c.role) || '—'));
+            }
+            if (row.length) kids.push(React.createElement('div', { key: 'cards', class: 'dfp-row' }, row));
+            return React.createElement('div', null,
+              sectionHead(t('presets')),
+              React.createElement('div', { class: 'dfp-box' }, kids));
           }
 
           function pillRow(label, ids, cls) {
@@ -798,6 +906,8 @@
                 verifyBanner(S)),
               renderRail(S),
               renderGates(S),
+              renderInterview(S),
+              renderPresets(S),
               renderVerification(S),
               renderEntries(S),
               renderPending(S),
