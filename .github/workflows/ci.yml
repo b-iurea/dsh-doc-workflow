@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  e2e:
+    name: syntax + e2e (node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # the harness runs on modern Node; 20 is the floor we support
+        node-version: ['20.x', '22.x', '24.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      # no npm dependencies: the plugin is plain ESM, the e2e suite imports the real module
+      - name: Syntax check (host + client + suite)
+        run: npm run check
+      - name: Headless e2e workflow suite
+        run: npm test

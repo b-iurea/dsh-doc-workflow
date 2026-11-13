@@ -1,4 +1,4 @@
 node_modules/
-test/ws/
+test/ws*/
 .doc-workflow/
 .DS_Store

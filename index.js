@@ -6,8 +6,12 @@
  * entry is source-backed with a verbatim quote: internal project file or
  * declared external source, never assumed; re-read loop on failure) ->
  * CONSISTENCY review (per-topic logical cross-check with a forced verdict
- * matrix; conflicts must be resolved) -> missing-information gate -> notes +
- * plan. Incremental input of new documents re-enters the reading stage.
+ * matrix; conflicts must be resolved) -> missing-information gate ->
+ * INTERVIEW gate (the user confirms the agent roles + delivery type proposed
+ * from the verified index) -> agent role presets: source-backed markdown
+ * cards under agents/ + PRESETS.md, or an explicit skip for answer-only
+ * objectives -> notes + plan. Incremental input of new documents re-enters
+ * the reading stage and re-arms the interview.
  *
  * All state lives in the session workspace under a per-session folder so the
  * user can read and edit it. The `docflow` tool is the single writer.
@@ -18,7 +22,7 @@ import path from 'node:path'
 
 export const inject = ['tools', 'sessions', 'workingDirectory', 'systemPrompt']
 
-const STATE_VERSION = 2
+const STATE_VERSION = 3
 const DEFAULT_DIR = '.doc-workflow'
 
 // ---------------------------------------------------------------------------
@@ -54,6 +58,12 @@ function nextId(state, prefix) {
     if (id.startsWith(prefix)) max = Math.max(max, Number(id.slice(1)))
   }
   return `${prefix}${max + 1}`
+}
+
+const GATE_DOCS = {
+  understanding: { file: 'questions-understanding.md', header: '# Understanding questions\n\n' },
+  gaps: { file: 'questions-gaps.md', header: '# Missing-information questions\n\n' },
+  interview: { file: 'questions-interview.md', header: '# Interview questions\n\n' },
 }
 
 const FACT_PATTERNS = [
@@ -121,6 +131,22 @@ function overallVerified(state) {
   return state.verification.status === 'passed' && ['passed', 'n/a'].includes(state.consistency.status)
 }
 
+/** routing once integrity + consistency are verified and the gaps gate is answered */
+function afterGapsAnswered(state) {
+  if (state.gates.interview.status === 'answered') {
+    if (state.interview.answerOnly || state.presets.status === 'emitted') state.stage = 'plan'
+    else state.stage = 'presets'
+  } else {
+    state.stage = 'interview'
+    state.gates.interview.status = 'open'
+  }
+}
+
+/** any edit that invalidates verification also invalidates emitted role cards */
+function presetsStale(state) {
+  if (state.presets && state.presets.status === 'emitted') state.presets.status = 'stale'
+}
+
 /** drop verdicts touching a changed/removed entry so its pairs must be re-reviewed */
 function clearConsistencyFor(state, id) {
   const c = state.consistency
@@ -152,9 +178,9 @@ async function renderConsistency(dirAbs, state) {
   await fs.writeFile(path.join(dirAbs, 'consistency.md'), md, 'utf8')
 }
 
-/** in-place upgrade of pre-v2 states; returns true if something changed */
+/** in-place upgrade of pre-current states; returns true if something changed */
 function migrateState(state) {
-  if (state.version === STATE_VERSION && state.consistency) return false
+  if (state.version === STATE_VERSION && state.consistency && state.gates && state.gates.interview && state.interview && state.presets) return false
   let dirty = false
   if (!state.consistency) {
     state.consistency = { status: 'n/a', verdicts: {}, updatedAt: undefined }
@@ -167,12 +193,35 @@ function migrateState(state) {
     }
   }
   if (state.version !== STATE_VERSION) {
-    // v1 trusted "line anchor, no quote" and had no consistency phase: force re-check
-    if (state.verification && state.verification.status === 'passed') {
-      state.verification.status = 'stale'
-      state.stage = 'indexing'
+    if (state.version < 2) {
+      // v1 trusted "line anchor, no quote" and had no consistency phase: force re-check
+      if (state.verification && state.verification.status === 'passed') {
+        state.verification.status = 'stale'
+        state.stage = 'indexing'
+      }
     }
     state.version = STATE_VERSION
+    dirty = true
+  }
+  // v2 -> v3: interview gate + presets shells
+  if (!state.gates) state.gates = { understanding: { status: 'open' }, gaps: { status: 'locked' } }
+  if (!state.gates.interview) {
+    state.gates.interview = { status: 'locked' }
+    dirty = true
+  }
+  if (!state.interview) {
+    state.interview = {}
+    dirty = true
+  }
+  if (!state.presets) {
+    state.presets = { status: 'none' }
+    dirty = true
+  }
+  // a v2 state parked at plan must still pass the interview + presets gates
+  // (a 'done' plan was written under v2 rules and is never revoked)
+  if (state.stage === 'plan') {
+    state.stage = 'interview'
+    state.gates.interview.status = 'open'
     dirty = true
   }
   return dirty
@@ -192,6 +241,15 @@ async function writeJson(file, value) {
 
 async function appendMd(file, text) {
   await fs.appendFile(file, text, 'utf8')
+}
+
+/** create a gate markdown file with its header if missing (migrated folders predate newer gate files) */
+async function ensureMd(file, header) {
+  try {
+    await fs.stat(file)
+  } catch {
+    await fs.writeFile(file, header, 'utf8')
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +349,8 @@ function guidanceFor(state) {
         g.push('FORM UNDERSTANDING QUESTIONS: wherever the objective is ambiguous or a passage is unclear/unreliable w.r.t. the objective, ask the user with ask_user_question, then log them with action=gate_ask phase=understanding, and record the user answers with action=gate_answer phase=understanding. The understanding gate must be answered before entries can be recorded.')
       if (state.gates.understanding.reconfirm)
         g.push('New documents were ingested: reconfirm your understanding with the user (gate_ask + gate_answer phase=understanding).')
+      if (state.gates.interview && state.gates.interview.reconfirm)
+        g.push('New documents were ingested: after re-verification reconfirm the interview with the user — a gate_answer phase=interview re-answer updates the roles and marks emitted presets stale.')
       g.push('Filter what you read into USEFUL and NON-USEFUL information for the objective and record it with action=add_entries (batch several entries per call). Every entry MUST be source-backed with a verbatim source_quote and a source_kind: "doc" (source_file = project file) or "external" (source_ref = URL or absolute path of the external written source). Assumed content is not admissible.')
       break
     case 'indexing':
@@ -311,8 +371,16 @@ function guidanceFor(state) {
     case 'gaps':
       g.push('Integrity and logical consistency verified. NOW ASK ABOUT MISSING INFORMATION: identify what is still missing to reach the objective, ask the user with ask_user_question, then log with gate_ask phase=gaps and record answers with gate_answer phase=gaps.')
       break
+    case 'interview':
+      g.push('RUN THE INTERVIEW GATE: from the verified index PROPOSE to the user which agent roles are needed to reach the objective and the delivery type (code / documents / both) — or whether the objective is answer-only (analysis, no execution roles). This is a confirmation, not an interrogation: present your proposal with ask_user_question, log it with gate_ask phase=interview, and record the confirmed result with gate_answer phase=interview carrying the interview payload {answer_only?, delivery?, roles?}.')
+      break
+    case 'presets':
+      g.push('WRITE THE ROLE CARDS: one card per confirmed role. Each card MUST justify itself with source_entries citing useful index entries (U…) — the existence of a role must be traceable to verified information (the role prompt_body itself is yours to write). Then call action=emit_presets cards=[{role, why, source_entries, prompt_body, write_scope?}]: the cards are rendered under agents/ + PRESETS.md and the plan gate opens.')
+      break
     case 'plan':
       g.push('All gates satisfied. Write the notes and the plan to reach the objective, then call action=write_plan with notes_md and plan_md (markdown). They are saved to NOTES.md and PLAN.md.')
+      if (state.presets && state.presets.status === 'emitted')
+        g.push('Reference the emitted role cards (agents/*.md) in the plan team section; write_plan appends the generated "Delivery & team (generated)" section.')
       break
     case 'done':
       g.push('Workflow complete. If new documents arrive, use action=ingest to re-enter the loop.')
@@ -338,6 +406,18 @@ function statusPayload(state, dirAbs) {
     gates: {
       understanding: gateSummary(state, 'understanding'),
       gaps: overallVerified(state) ? gateSummary(state, 'gaps') : 'locked until integrity + consistency pass',
+      interview: overallVerified(state) ? gateSummary(state, 'interview') : 'locked until integrity + consistency pass',
+    },
+    interview: {
+      status: gateSummary(state, 'interview'),
+      delivery: state.interview.delivery || [],
+      answer_only: !!state.interview.answerOnly,
+      roles: state.interview.roles || [],
+    },
+    presets: {
+      status: state.presets.status,
+      cards: (state.presets.cards || []).map((c) => ({ role: c.role, source_entries: c.source_entries })),
+      ...(state.presets.skipReason ? { skip_reason: state.presets.skipReason } : {}),
     },
     verification: state.verification.status,
     verified: overallVerified(state),
@@ -363,7 +443,10 @@ function freshState(objective, docRoots, dirName) {
     gates: {
       understanding: { status: 'open', asked: false, answered: false },
       gaps: { status: 'locked' },
+      interview: { status: 'locked' },
     },
+    interview: {},
+    presets: { status: 'none' },
     verification: { status: 'unverified', lastRun: undefined, failed: [], unanchored: [], unattested: [] },
     consistency: { status: 'n/a', verdicts: {}, updatedAt: undefined },
     entries: {},
@@ -462,6 +545,22 @@ async function verifyEntries(cwd, state) {
 }
 
 // ---------------------------------------------------------------------------
+// agent role presets (emit_presets)
+// ---------------------------------------------------------------------------
+
+function roleSlug(role) {
+  const s = String(role).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  return s || 'role'
+}
+
+/** advisory overlap: string-equal or one scope is a path prefix of the other */
+function scopeOverlap(a, b) {
+  const na = String(a).replace(/\/+$/, '')
+  const nb = String(b).replace(/\/+$/, '')
+  return na === nb || na.startsWith(nb + '/') || nb.startsWith(na + '/')
+}
+
+// ---------------------------------------------------------------------------
 // tool implementation
 // ---------------------------------------------------------------------------
 
@@ -490,8 +589,7 @@ async function runDocflow(ctx, exec, args) {
         `# Objective\n\n${st.objective}\n\nDocument roots:\n${st.doc_roots.map((d) => `- ${d}`).join('\n')}\n\nStarted: ${st.createdAt}\n`,
         'utf8',
       )
-      await fs.writeFile(path.join(startAbs, 'questions-understanding.md'), '# Understanding questions\n\n', 'utf8')
-      await fs.writeFile(path.join(startAbs, 'questions-gaps.md'), '# Missing-information questions\n\n', 'utf8')
+      for (const gd of Object.values(GATE_DOCS)) await fs.writeFile(path.join(startAbs, gd.file), gd.header, 'utf8')
       await writeJson(path.join(startAbs, 'state.json'), st)
       await renderIndex(startAbs, st)
       return { ok: true, stage: st.stage, folder: startAbs, next: guidanceFor(st) }
@@ -514,14 +612,16 @@ async function runDocflow(ctx, exec, args) {
 
     case 'gate_ask': {
       const phase = args.phase
-      if (phase !== 'understanding' && phase !== 'gaps') return fail('gate_ask requires phase=understanding|gaps.')
+      if (phase !== 'understanding' && phase !== 'gaps' && phase !== 'interview') return fail('gate_ask requires phase=understanding|gaps|interview.')
       if (!Array.isArray(args.questions) || args.questions.length === 0) return fail('gate_ask requires questions: [{question, why?}].')
-      if (phase === 'gaps' && !overallVerified(state)) return fail('The gaps gate opens only after verify (integrity) passes AND the consistency matrix is complete.', 'Record entries, attest, run verify, then close the crosscheck with action=crosscheck; then ask about missing information.')
+      if ((phase === 'gaps' || phase === 'interview') && !overallVerified(state)) return fail(`The ${phase} gate opens only after verify (integrity) passes AND the consistency matrix is complete.`, 'Record entries, attest, run verify, then close the crosscheck with action=crosscheck; then ask the gate questions.')
       const g = state.gates[phase]
       g.status = 'pending'
       g.asked = true
       g.askedAt = now()
-      const file = path.join(dirAbs, phase === 'understanding' ? 'questions-understanding.md' : 'questions-gaps.md')
+      const gd = GATE_DOCS[phase]
+      const file = path.join(dirAbs, gd.file)
+      await ensureMd(file, gd.header)
       let md = `\n## Asked ${now()}\n\n`
       for (const q of args.questions) md += `- **Q**: ${q.question}${q.why ? `\n  - _why_: ${q.why}` : ''}\n`
       await appendMd(file, md)
@@ -531,20 +631,51 @@ async function runDocflow(ctx, exec, args) {
 
     case 'gate_answer': {
       const phase = args.phase
-      if (phase !== 'understanding' && phase !== 'gaps') return fail('gate_answer requires phase=understanding|gaps.')
+      if (phase !== 'understanding' && phase !== 'gaps' && phase !== 'interview') return fail('gate_answer requires phase=understanding|gaps|interview.')
       if (!Array.isArray(args.answers) || args.answers.length === 0) return fail('gate_answer requires answers: [{question, answer}] as the user replied.')
       const g = state.gates[phase]
-      if (g.status === 'locked') return fail(`The ${phase} gate is locked.`, phase === 'gaps' ? 'Run verify successfully first.' : undefined)
+      if (g.status === 'locked') return fail(`The ${phase} gate is locked.`, phase === 'gaps' || phase === 'interview' ? 'Run verify successfully first.' : undefined)
+      const iv = phase === 'interview' ? args.interview : undefined
+      if (phase === 'interview') {
+        if (!iv || typeof iv !== 'object')
+          return fail('gate_answer phase=interview requires the interview payload {answer_only?, delivery?, roles?} as confirmed by the user.', 'Either answer_only: true (analysis-only objective), or delivery: a non-empty array of "code"/"docs" plus roles: a non-empty array of role name strings.')
+        if (iv.answer_only !== true) {
+          const okDelivery = Array.isArray(iv.delivery) && iv.delivery.length > 0 && iv.delivery.every((d) => d === 'code' || d === 'docs')
+          const okRoles = Array.isArray(iv.roles) && iv.roles.length > 0 && iv.roles.every((r) => typeof r === 'string' && r.trim() !== '')
+          if (!okDelivery || !okRoles) return fail('The interview payload needs delivery: a non-empty array of "code"|"docs" AND roles: a non-empty array of role names — or answer_only: true for an analysis-only objective.')
+        }
+      }
       g.status = 'answered'
       g.asked = true
       g.answered = true
       g.answeredAt = now()
       if (phase === 'understanding') g.reconfirm = false
-      const file = path.join(dirAbs, phase === 'understanding' ? 'questions-understanding.md' : 'questions-gaps.md')
+      const gd = GATE_DOCS[phase]
+      const file = path.join(dirAbs, gd.file)
+      await ensureMd(file, gd.header)
       let md = `\n## Answers ${now()}\n\n`
       for (const a of args.answers) md += `- **Q**: ${a.question}\n  - **A**: ${a.answer}\n`
+      if (iv)
+        md += `- **Interview result**: ${iv.answer_only === true ? 'answer-only (analysis, no execution roles)' : `delivery=${iv.delivery.join('+')}; roles=${iv.roles.map((r) => r.trim()).join(', ')}`}\n`
       await appendMd(file, md)
-      if (phase === 'gaps' && overallVerified(state)) state.stage = 'plan'
+      if (phase === 'interview') {
+        if (state.presets.status === 'emitted') state.presets.status = 'stale'
+        const answerOnly = iv.answer_only === true
+        state.interview = {
+          answerOnly,
+          delivery: answerOnly ? [] : iv.delivery.slice(),
+          roles: answerOnly ? [] : iv.roles.map((r) => r.trim()),
+          answeredAt: now(),
+        }
+        g.reconfirm = false
+        if (answerOnly) {
+          state.presets = { status: 'skipped', skipReason: 'interview: delivery=answer-only, no execution roles', skippedAt: now() }
+          state.stage = 'plan'
+        } else {
+          state.stage = 'presets'
+        }
+      }
+      if (phase === 'gaps' && overallVerified(state)) afterGapsAnswered(state)
       await writeJson(path.join(dirAbs, 'state.json'), state)
       await renderIndex(dirAbs, state)
       return { ok: true, phase, stage: state.stage, next: guidanceFor(state) }
@@ -583,6 +714,7 @@ async function runDocflow(ctx, exec, args) {
       }
       state.stage = 'indexing'
       if (state.verification.status === 'passed') state.verification.status = 'stale'
+      presetsStale(state)
       await writeJson(path.join(dirAbs, 'state.json'), state)
       await renderIndex(dirAbs, state)
       return { ok: true, added, stage: state.stage, next: guidanceFor(state) }
@@ -600,6 +732,7 @@ async function runDocflow(ctx, exec, args) {
       e.attest = undefined
       e.verify = undefined
       state.verification.status = 'stale'
+      presetsStale(state)
       clearConsistencyFor(state, args.id)
       await writeJson(path.join(dirAbs, 'state.json'), state)
       await renderIndex(dirAbs, state)
@@ -611,6 +744,7 @@ async function runDocflow(ctx, exec, args) {
       if (!state.entries[args.id]) return fail(`Unknown entry id ${args.id}.`)
       delete state.entries[args.id]
       state.verification.status = 'stale'
+      presetsStale(state)
       clearConsistencyFor(state, args.id)
       await writeJson(path.join(dirAbs, 'state.json'), state)
       await renderIndex(dirAbs, state)
@@ -628,6 +762,7 @@ async function runDocflow(ctx, exec, args) {
         e.attest = { verdict: args.verdict, note: args.note, at: now() }
       }
       state.verification.status = 'stale'
+      presetsStale(state)
       await writeJson(path.join(dirAbs, 'state.json'), state)
       await renderIndex(dirAbs, state)
       return { ok: true, attested: targets.length, verdict: args.verdict, next: 'Now run verify: INTEGRITY (sources readable + quotes verbatim). If it passes, close the CONSISTENCY matrix with action=crosscheck.' }
@@ -657,7 +792,7 @@ async function runDocflow(ctx, exec, args) {
         consistency = recomputeConsistency(state)
         await renderConsistency(dirAbs, state)
         if (consistency === 'passed' || consistency === 'n/a') {
-          if (state.gates.gaps.status === 'answered') state.stage = 'plan'
+          if (state.gates.gaps.status === 'answered') afterGapsAnswered(state)
           else {
             state.stage = 'gaps'
             state.gates.gaps.status = 'open'
@@ -701,7 +836,7 @@ async function runDocflow(ctx, exec, args) {
       const cs = recomputeConsistency(state)
       await renderConsistency(dirAbs, state)
       if (cs === 'passed' || cs === 'n/a') {
-        if (state.gates.gaps.status === 'answered') state.stage = 'plan'
+        if (state.gates.gaps.status === 'answered') afterGapsAnswered(state)
         else {
           state.stage = 'gaps'
           state.gates.gaps.status = 'open'
@@ -725,12 +860,107 @@ async function runDocflow(ctx, exec, args) {
       }
     }
 
+    case 'emit_presets': {
+      if (!overallVerified(state)) return fail('emit_presets opens only after verify (integrity) passes AND the consistency matrix is complete.', guidanceFor(state).join(' '))
+      if (state.gates.interview.status !== 'answered') return fail('Run the interview gate first: gate_ask + gate_answer phase=interview with the roles + delivery confirmed by the user.', 'The interview gate proposes which agent roles the objective needs; it opens once verification + consistency pass.')
+      if (state.interview.answerOnly) return fail('Answer-only objective: presets are skipped by design.', 'No execution roles were confirmed — proceed to write_plan.')
+      if (!Array.isArray(args.cards) || args.cards.length === 0) return fail('emit_presets requires cards: [{role, why, source_entries, prompt_body, write_scope?}] — one card per confirmed role.')
+      const cards = []
+      const slugs = new Set()
+      for (const raw of args.cards) {
+        const role = typeof raw.role === 'string' ? raw.role.trim() : ''
+        if (role === '') return fail('Each card needs a non-empty role (as confirmed in the interview).')
+        if (typeof raw.why !== 'string' || raw.why.trim() === '') return fail(`Card "${role}": why is required — justify why this role exists.`)
+        if (typeof raw.prompt_body !== 'string' || raw.prompt_body.trim() === '') return fail(`Card "${role}": prompt_body is required — the role's operative instructions.`)
+        if (!Array.isArray(raw.source_entries) || raw.source_entries.length === 0)
+          return fail(`Card "${role}": source_entries is required and non-empty — the existence of a role must be traceable to verified index entries.`)
+        for (const sid of raw.source_entries) {
+          if (!validId(sid) || !state.entries[sid]) return fail(`Card "${role}": source_entries references unknown entry ${sid}.`)
+          if (!state.entries[sid].useful) return fail(`Card "${role}": source_entries must cite USEFUL index entries — ${sid} was filtered as not useful.`)
+        }
+        let slug = roleSlug(role)
+        if (slugs.has(slug)) {
+          let k = 2
+          while (slugs.has(`${slug}-${k}`)) k++
+          slug = `${slug}-${k}`
+        }
+        slugs.add(slug)
+        const writeScope = Array.isArray(raw.write_scope) ? raw.write_scope.filter((s) => typeof s === 'string' && s.trim() !== '') : []
+        cards.push({
+          role,
+          why: raw.why.trim(),
+          source_entries: [...new Set(raw.source_entries)],
+          prompt_body: raw.prompt_body,
+          ...(writeScope.length ? { write_scope: writeScope } : {}),
+          file: `agents/${slug}.md`,
+        })
+      }
+      const agentsDir = path.join(dirAbs, 'agents')
+      await fs.rm(agentsDir, { recursive: true, force: true })
+      await fs.mkdir(agentsDir, { recursive: true })
+      const files = []
+      for (const c of cards) {
+        let md = '---\n'
+        md += `role: ${c.role}\n`
+        md += `delivery: ${(state.interview.delivery || []).join(', ')}\n`
+        md += 'source_entries:\n'
+        for (const sid of c.source_entries) md += `  - ${sid}\n`
+        if (c.write_scope) {
+          md += 'write_scope:\n'
+          for (const s of c.write_scope) md += `  - ${s}\n`
+        }
+        md += `---\n\n${c.prompt_body.trim()}\n`
+        const abs = path.join(dirAbs, c.file)
+        await fs.writeFile(abs, md, 'utf8')
+        files.push(abs)
+      }
+      const cell = (v) => {
+        const s = Array.isArray(v) ? v.join(', ') : v === null || v === undefined ? '' : String(v)
+        const t = s.replace(/\|/g, '/').replace(/\n/g, ' ').trim()
+        return t === '' ? '—' : t
+      }
+      let idxDoc = `# Agent role presets — ${now()}\n\n`
+      idxDoc += 'Role cards generated from the confirmed interview, each justified by cited verified index entries.\n\n'
+      idxDoc += '| role | why | source entries | delivery | write scope | file |\n| --- | --- | --- | --- | --- | --- |\n'
+      for (const c of cards) idxDoc += `| ${cell(c.role)} | ${cell(c.why)} | ${cell(c.source_entries)} | ${cell(state.interview.delivery || [])} | ${cell(c.write_scope || [])} | ${cell(c.file)} |\n`
+      await fs.writeFile(path.join(dirAbs, 'PRESETS.md'), idxDoc, 'utf8')
+      const warnings = []
+      const flagged = new Set()
+      for (let i = 0; i < cards.length; i++) {
+        for (let j = i + 1; j < cards.length; j++) {
+          const a = cards[i].write_scope || []
+          const b = cards[j].write_scope || []
+          if (!a.length || !b.length) continue
+          if (!a.some((sa) => b.some((sb) => scopeOverlap(sa, sb)))) continue
+          const key = `${cards[i].role}|${cards[j].role}`
+          if (flagged.has(key)) continue
+          flagged.add(key)
+          warnings.push(`write_scope overlap: ${cards[i].role} ↔ ${cards[j].role}`)
+        }
+      }
+      state.presets = { status: 'emitted', emittedAt: now(), cards }
+      state.stage = 'plan'
+      await writeJson(path.join(dirAbs, 'state.json'), state)
+      await renderIndex(dirAbs, state)
+      return {
+        ok: true,
+        stage: 'plan',
+        emitted: cards.length,
+        files,
+        presets_index: path.join(dirAbs, 'PRESETS.md'),
+        ...(warnings.length ? { warnings } : {}),
+        next: guidanceFor(state),
+      }
+    }
+
     case 'ingest': {
       if (!Array.isArray(args.paths) || args.paths.length === 0) return fail('ingest requires paths: new or changed documents.')
       state.pendingDocs = [...new Set([...(state.pendingDocs || []), ...args.paths])]
       state.stage = 'reading'
       state.verification.status = 'unverified'
       state.gates.understanding.reconfirm = state.gates.understanding.status === 'answered'
+      state.gates.interview.reconfirm = state.gates.interview.status === 'answered'
+      presetsStale(state)
       await writeJson(path.join(dirAbs, 'state.json'), state)
       await renderIndex(dirAbs, state)
       return { ok: true, pending: state.pendingDocs, stage: state.stage, next: guidanceFor(state) }
@@ -740,7 +970,12 @@ async function runDocflow(ctx, exec, args) {
       if (state.stage !== 'plan') return fail(`write_plan is only allowed at stage "plan" (current: ${state.stage}).`, guidanceFor(state).join(' '))
       if (typeof args.notes_md !== 'string' || typeof args.plan_md !== 'string') return fail('write_plan requires notes_md and plan_md (markdown strings).')
       await fs.writeFile(path.join(dirAbs, 'NOTES.md'), `# Notes\n\n${args.notes_md}\n`, 'utf8')
-      await fs.writeFile(path.join(dirAbs, 'PLAN.md'), `# Plan to reach the objective\n\nObjective: ${state.objective}\n\n${args.plan_md}\n`, 'utf8')
+      let planDoc = `# Plan to reach the objective\n\nObjective: ${state.objective}\n\n${args.plan_md}\n`
+      if (state.presets.status === 'emitted') {
+        planDoc += `\n## Delivery & team (generated)\n\nDelivery: ${(state.interview.delivery || []).join(', ') || 'answer-only'}\n\n`
+        for (const c of state.presets.cards) planDoc += `- **${c.role}** — role card: ${c.file}\n`
+      }
+      await fs.writeFile(path.join(dirAbs, 'PLAN.md'), planDoc, 'utf8')
       state.plan = { writtenAt: now(), notes: 'NOTES.md', plan: 'PLAN.md' }
       state.stage = 'done'
       await writeJson(path.join(dirAbs, 'state.json'), state)
@@ -749,7 +984,7 @@ async function runDocflow(ctx, exec, args) {
     }
 
     default:
-      return fail(`Unknown action ${action}.`, 'Actions: status, start, gate_ask, gate_answer, add_entries, update_entry, remove_entry, attest, verify, crosscheck, ingest, write_plan, reset.')
+      return fail(`Unknown action ${action}.`, 'Actions: status, start, gate_ask, gate_answer, add_entries, update_entry, remove_entry, attest, verify, crosscheck, emit_presets, ingest, write_plan, reset.')
   }
 }
 
@@ -762,21 +997,45 @@ function makeTool(ctx) {
     name: 'docflow',
   description:
     'Document-driven workflow engine for project work: turn project documents into a source-verified index and a plan. ' +
-    'Stage machine: start(objective, doc_roots) -> read docs -> understanding gate (ask the user via ask_user_question, then gate_ask/gate_answer phase=understanding) -> add_entries (useful/not-useful filtered info; every entry MUST carry a verbatim source_quote plus source_kind "doc" (project source_file) or "external" (source_ref URL/path) — assumed content is rejected) -> attest(ok|suspect; trusted for external sources after human review) trustworthiness -> verify = INTEGRITY check (source readable + quote found verbatim; unvouched external sources keep it from passing; failures send you back to re-read and fix) -> CONSISTENCY phase: crosscheck records one verdict per pair of useful entries (consistent|conflict); conflicts block the workflow until the entries are corrected and re-reviewed -> gaps gate (ask the user what information is missing to reach the objective, phase=gaps) -> write_plan(notes_md, plan_md). ' +
-    'New documents arrive via ingest and re-enter the loop. status returns the current stage, gate/verification/consistency state and the exact next steps — follow its "next" guidance. The workflow state lives in a .doc-workflow/ folder in the session workspace (objective.md, index.md, questions-*.md, verification.md, consistency.md, NOTES.md, PLAN.md). Use this tool whenever asked to analyze project documents toward an objective, build/update index.md, verify source reliability or logical coherence, or write notes/plan from documentation.',
+    'Stage machine: start(objective, doc_roots) -> read docs -> understanding gate (ask the user via ask_user_question, then gate_ask/gate_answer phase=understanding) -> add_entries (useful/not-useful filtered info; every entry MUST carry a verbatim source_quote plus source_kind "doc" (project source_file) or "external" (source_ref URL/path) — assumed content is rejected) -> attest(ok|suspect; trusted for external sources after human review) trustworthiness -> verify = INTEGRITY check (source readable + quote found verbatim; unvouched external sources keep it from passing; failures send you back to re-read and fix) -> CONSISTENCY phase: crosscheck records one verdict per pair of useful entries (consistent|conflict); conflicts block the workflow until the entries are corrected and re-reviewed -> gaps gate (ask the user what information is missing to reach the objective, phase=gaps) -> interview gate (phase=interview: propose the agent roles + delivery type code/docs/answer-only, the user confirms via gate_answer with the interview payload) -> emit_presets writes source-backed agent role cards under agents/ + PRESETS.md (answer-only skips presets explicitly) -> write_plan(notes_md, plan_md). ' +
+    'New documents arrive via ingest and re-enter the loop. status returns the current stage, gate/verification/consistency state and the exact next steps — follow its "next" guidance. The workflow state lives in a .doc-workflow/ folder in the session workspace (objective.md, index.md, questions-*.md, verification.md, consistency.md, agents/<role>.md, PRESETS.md, NOTES.md, PLAN.md). Use this tool whenever asked to analyze project documents toward an objective, build/update index.md, verify source reliability or logical coherence, or write notes/plan from documentation.',
   parameters: {
     type: 'object',
     properties: {
       action: {
         type: 'string',
-        enum: ['status', 'start', 'gate_ask', 'gate_answer', 'add_entries', 'update_entry', 'remove_entry', 'attest', 'verify', 'crosscheck', 'ingest', 'write_plan', 'reset'],
+        enum: ['status', 'start', 'gate_ask', 'gate_answer', 'add_entries', 'update_entry', 'remove_entry', 'attest', 'verify', 'crosscheck', 'emit_presets', 'ingest', 'write_plan', 'reset'],
       },
       objective: { type: 'string', description: 'start: the work objective as defined by the user.' },
       doc_roots: { type: 'array', items: { type: 'string' }, description: 'start: documents/directories to read.' },
       dir: { type: 'string', description: 'start: optional state folder name (default ".doc-workflow").' },
-      phase: { type: 'string', enum: ['understanding', 'gaps'], description: 'gate_ask/gate_answer.' },
+      phase: { type: 'string', enum: ['understanding', 'gaps', 'interview'], description: 'gate_ask/gate_answer.' },
       questions: { type: 'array', items: { type: 'object', properties: { question: { type: 'string' }, why: { type: 'string' } }, required: ['question'] } },
       answers: { type: 'array', items: { type: 'object', properties: { question: { type: 'string' }, answer: { type: 'string' } }, required: ['question', 'answer'] } },
+      interview: {
+        type: 'object',
+        properties: {
+          answer_only: { type: 'boolean', description: 'true when the objective is analysis only: no execution roles, presets skipped by design.' },
+          delivery: { type: 'array', items: { type: 'string', enum: ['code', 'docs'] }, description: 'what the team will deliver: "code", "docs", or both.' },
+          roles: { type: 'array', items: { type: 'string' }, description: 'agent role names confirmed by the user (one card each in emit_presets).' },
+        },
+        description: 'gate_answer phase=interview: the confirmed interview result — either answer_only: true, or a non-empty delivery array plus a non-empty roles array.',
+      },
+      cards: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            role: { type: 'string', description: 'role name as confirmed in the interview.' },
+            why: { type: 'string', description: 'why this role exists for the objective — justification, not flavor text.' },
+            source_entries: { type: 'array', items: { type: 'string' }, description: 'index entry ids (U…) that make the role necessary; must be useful, verified entries.' },
+            prompt_body: { type: 'string', description: 'the operative instructions put in the role card (markdown).' },
+            write_scope: { type: 'array', items: { type: 'string' }, description: 'optional paths this role expects to modify; overlaps are reported as warnings.' },
+          },
+          required: ['role', 'why', 'source_entries', 'prompt_body'],
+        },
+        description: 'emit_presets: one source-backed agent role card per confirmed role.',
+      },
       entries: {
         type: 'array',
         items: {
@@ -849,7 +1108,7 @@ const PROMPT_SECTION = {
   text:
     '## Document workflow (docflow)\n' +
     'When a task means understanding or planning work from local project documents (analyze docs toward an objective, build index.md, verify information trustworthiness, write notes/plan), drive the flow with the `docflow` tool instead of ad-hoc notes. ' +
-    'It enforces the loop: objective -> read -> ask the user the understanding questions (ask_user_question) -> filter info into useful/not-useful entries, each source-backed with a verbatim quote (internal doc file or declared external source — never assumed) -> attest + verify INTEGRITY (re-read failures) -> CONSISTENCY: cross-check every pair of useful entries with crosscheck verdicts and resolve conflicts -> ask the user about missing information -> notes + plan. ' +
+    'It enforces the loop: objective -> read -> ask the user the understanding questions (ask_user_question) -> filter info into useful/not-useful entries, each source-backed with a verbatim quote (internal doc file or declared external source — never assumed) -> attest + verify INTEGRITY (re-read failures) -> CONSISTENCY: cross-check every pair of useful entries with crosscheck verdicts and resolve conflicts -> ask the user about missing information -> interview gate: propose the agent roles + delivery type (code/docs/answer-only), the user confirms, then emit_presets writes the source-backed role cards (agents/*.md + PRESETS.md) -> notes + plan. ' +
     'Whenever docflow returns "next" guidance, follow it literally.',
 }
 
