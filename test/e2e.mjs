@@ -9,6 +9,9 @@ const WS = path.join(ROOT, 'ws')
 const WS2 = path.join(ROOT, 'ws-migrate')
 const WS3 = path.join(ROOT, 'ws-migrate2')
 const WS4 = path.join(ROOT, 'ws-answer')
+const WS5 = path.join(ROOT, 'ws-tasks')
+const WS6 = path.join(ROOT, 'ws-tasks2')
+const WS7 = path.join(ROOT, 'ws-migrate3')
 
 // --- lossless-JSON guard (mirrors the harness validation) ---
 function scanLossless(v, where) {
@@ -56,11 +59,34 @@ async function callOn(t, args) {
   return out
 }
 
+// synthetic, fully-verified v3 state parked at stage "tasks" (v3.1 fixtures)
+function v3State(overrides) {
+  return {
+    kind: 'docflow', version: 3, dir: '.doc-workflow', objective: 'o', doc_roots: ['docs'], stage: 'tasks',
+    gates: {
+      understanding: { status: 'answered', asked: true, answered: true },
+      gaps: { status: 'answered', asked: true, answered: true },
+      interview: { status: 'answered', asked: true, answered: true },
+    },
+    interview: { answerOnly: false, delivery: ['code'], roles: ['Migrator'], answeredAt: 'x' },
+    presets: { status: 'emitted', emittedAt: 'x', cards: [{ role: 'Migrator', why: 'w', source_entries: ['U1'], prompt_body: 'p', file: 'agents/migrator.md' }] },
+    verification: { status: 'passed', lastRun: 'x', failed: [], unanchored: [], unattested: [], suspect: [], externals: [] },
+    consistency: { status: 'passed', verdicts: {}, updatedAt: 'x' },
+    entries: { U1: { useful: true, title: 't', content: 'c', source_kind: 'doc', source_file: 'docs/api.md', source_quote: 'The billing team confirmed that Billing API v2 goes live on 2026-03-01.', addedAt: 'x' } },
+    pendingDocs: [], plan: { writtenAt: 'x', notes: 'NOTES.md', plan: 'PLAN.md' },
+    createdAt: 'x', updatedAt: 'x',
+    ...overrides,
+  }
+}
+
 // fresh workspace
 await fs.rm(WS, { recursive: true, force: true })
 await fs.rm(WS2, { recursive: true, force: true })
 await fs.rm(WS3, { recursive: true, force: true })
 await fs.rm(WS4, { recursive: true, force: true })
+await fs.rm(WS5, { recursive: true, force: true })
+await fs.rm(WS6, { recursive: true, force: true })
+await fs.rm(WS7, { recursive: true, force: true })
 await fs.cp(path.join(ROOT, 'docs'), path.join(WS, 'docs'), { recursive: true })
 assert(tool && tool.name === 'docflow', 'tool registered')
 
@@ -193,6 +219,10 @@ await call({ action: 'gate_ask', phase: 'gaps', questions: [{ question: 'Volume 
 r = await call({ action: 'gate_answer', phase: 'gaps', answers: [{ question: 'Volume threshold to block cutover?', answer: 'unknown, monitor' }] })
 record('11b', r.ok && r.stage === 'interview', 'gaps answered -> interview')
 
+// 11b2. v3.1: emit_tasks outside the tasks stage is rejected (§4.1)
+r = await call({ action: 'emit_tasks', tasks: [{ subject: 'nope', description: 'd', role: 'Migrator', plan_phase: 'P' }] })
+record('11b2', r.ok === false && /only allowed at stage/.test(r.error) && /"tasks"/.test(r.error), 'emit_tasks rejected outside tasks stage: ' + r.error)
+
 // 11c0. emit_presets before the interview gate is answered -> locked
 r = await call({ action: 'emit_presets', cards: [{ role: 'Migrator', why: 'w', source_entries: ['U1'], prompt_body: 'p' }] })
 record('11c0', r.ok === false && /interview/i.test(r.error), 'emit_presets pre-interview locked: ' + r.error)
@@ -235,15 +265,70 @@ record('11c7', r.ok && r.stage === 'plan' && r.emitted === 2 && Array.isArray(r.
 }
 
 r = await call({ action: 'write_plan', notes_md: '# Notes\n\nv2 GA 2026-03-01; idempotency key; avoid month-end; v1 +6mo.', plan_md: '# Plan\n\n1. Wire idempotency keys\n2. Schedule early March\n3. Alert v1 >100rps' })
-record('11c', r.ok && r.stage === 'done', 'write_plan -> done')
+record('11c', r.ok && r.stage === 'tasks', 'write_plan with emitted presets -> tasks stage (v3.1 §1; was done)')
 
 // 12. final status (must be lossless — scanLossless already enforced) + generated team section
 r = await call({ action: 'status' })
-record(12, r.ok && r.stage === 'done' && r.entries.useful === 4 && r.entries.not_useful === 1 && r.verified === true && r.consistency.status === 'passed' && r.plan && r.plan.notes.endsWith('NOTES.md') && r.interview.status === 'answered' && r.interview.answer_only === false && JSON.stringify(r.interview.delivery) === '["code"]' && r.interview.roles.length === 2 && r.presets.status === 'emitted' && r.presets.cards.length === 2, 'final status clean: done, 4U/1N, verified, interview + presets exposed')
+record(12, r.ok && r.stage === 'tasks' && r.entries.useful === 4 && r.entries.not_useful === 1 && r.verified === true && r.consistency.status === 'passed' && r.plan && r.plan.notes.endsWith('NOTES.md') && r.interview.status === 'answered' && r.interview.answer_only === false && JSON.stringify(r.interview.delivery) === '["code"]' && r.interview.roles.length === 2 && r.presets.status === 'emitted' && r.presets.cards.length === 2 && r.tasks.status === 'pending' && r.tasks.count === 0, 'status clean: tasks stage, 4U/1N, verified, interview + presets + pending tasks exposed')
 {
   const plan = await fs.readFile(path.join(WS, '.doc-workflow/PLAN.md'), 'utf8')
   record('12b', plan.includes('## Delivery & team (generated)') && plan.includes('agents/migrator.md'), 'PLAN.md carries the generated delivery & team section')
+  record('12b2', plan.includes('Task drafts: TASKS.md (pending)'), 'PLAN.md gains the task-drafts pointer, pending at first write (§7)')
 }
+
+// 12t. v3.1 emit_tasks — hard validations at the tasks stage (§4)
+r = await call({ action: 'emit_tasks', tasks: [{ subject: 'Wire keys', description: 'd', role: 'Scribe', plan_phase: 'P' }] })
+record('12t1', r.ok === false && /Scribe/.test(r.error) && /Migrator, Reviewer/.test(r.error), 'unknown role rejected listing valid card roles: ' + r.error)
+r = await call({ action: 'emit_tasks', tasks: [{ subject: '   ', description: 'd', role: 'Migrator', plan_phase: 'P' }] })
+record('12t2', r.ok === false && /non-empty subject/.test(r.error), 'empty subject rejected: ' + r.error)
+r = await call({ action: 'emit_tasks', tasks: [
+  { subject: 'Alpha', description: 'd', role: 'Migrator', plan_phase: 'P', blocked_by: ['beta'] },
+  { subject: 'Beta', description: 'd', role: 'Reviewer', plan_phase: 'P', blocked_by: ['gamma'] },
+  { subject: 'Gamma', description: 'd', role: 'Reviewer', plan_phase: 'P', blocked_by: ['alpha'] },
+] })
+record('12t3', r.ok === false && r.error.includes('alpha → beta → gamma → alpha'), 'blocked_by cycle rejected with the cycle path: ' + r.error)
+r = await call({ action: 'emit_tasks', tasks: [{ subject: 'Solo', description: 'd', role: 'Migrator', plan_phase: 'P', blocked_by: ['solo'] }] })
+record('12t4', r.ok === false && r.error.includes('solo → solo'), 'self-block rejected with the cycle path: ' + r.error)
+r = await call({ action: 'emit_tasks', tasks: [{ subject: 'Solo', description: 'd', role: 'Migrator', plan_phase: 'P', blocked_by: ['nope-9'] }] })
+record('12t5', r.ok === false && /nope-9/.test(r.error), 'blocked_by must reference an id in this batch: ' + r.error)
+r = await call({ action: 'emit_tasks', tasks: [] })
+record('12t6', r.ok === false && /skip_reason/.test(r.error), 'empty batch rejected without skip_reason: ' + r.error)
+
+// 12t7. happy path -> done, with the no-markers coverage warning (§4.7)
+const tasksA = [
+  { subject: 'Wire idempotency keys', description: 'Add the idempotency key header to every POST /v2/invoices caller path; block merges that miss it.', role: 'Reviewer', plan_phase: 'Phase 1 — keys' },
+  { subject: 'Migration scripts', description: 'Write reversible v1->v2 invoice migrations, sequenced before cutover; respect the month-end freeze.', role: 'Migrator', plan_phase: 'Phase 1 — keys' },
+  { subject: 'Cutover runbook', description: 'Document the early-March cutover avoiding the last 2 business days; wire the v1 >100rps alert.', role: 'Migrator', plan_phase: 'Phase 2 — cutover', write_scopes: ['docs/ops/'], blocked_by: ['migration-scripts', 'migration-scripts', 'wire-idempotency-keys'] },
+]
+r = await call({ action: 'emit_tasks', tasks: tasksA })
+record('12t7', r.ok && r.stage === 'done' && r.emitted === 3 && Array.isArray(r.warnings) && r.warnings.includes('coverage: PLAN.md phase markers not found'), 'emit_tasks happy path -> done + no-markers coverage warning')
+{
+  const tk = await fs.readFile(path.join(WS, '.doc-workflow/TASKS.md'), 'utf8')
+  record('12t8', tk.includes('# Task drafts') && tk.includes('machine consumers') && tk.includes('team_task_create') && tk.includes('## Cutover runbook') && tk.includes('- **role**: Migrator · **plan phase**: Phase 2 — cutover') && tk.includes('- **write_scopes**: `docs/ops/`') && tk.includes('- **blocked_by**: migration-scripts, wire-idempotency-keys') && tk.includes('Document the early-March cutover'), 'TASKS.md rendered: header + 1:1 pointer + sections + deduped blocked_by + description')
+}
+{
+  const st = JSON.parse(await fs.readFile(path.join(WS, '.doc-workflow/state.json'), 'utf8'))
+  const it = st.tasks.items
+  record('12t9', st.tasks.status === 'emitted' && !st.tasks.stale && it.length === 3 && it[0].id === 'wire-idempotency-keys' && it[0].description.startsWith('Add the idempotency key') && JSON.stringify(it[0].write_scopes) === '["src/migrations/"]' && JSON.stringify(it[2].write_scopes) === '["docs/ops/"]' && JSON.stringify(it[2].blocked_by) === '["migration-scripts","wire-idempotency-keys"]' && it.every((x) => x.subject && x.role && x.plan_phase), 'state tasks items complete: description kept, card-inherited + overridden scopes, deduped refs')
+}
+r = await call({ action: 'status' })
+record('12t10', r.tasks.status === 'emitted' && r.tasks.count === 3 && r.tasks.stale === false && r.tasks.warnings.length === 1 && !!r.tasks.emittedAt, 'status tasks block: emitted + count + warnings + emittedAt')
+
+// 12t11. staleness chain (§5): entry update -> presets.stale AND tasks.stale
+r = await call({ action: 'update_entry', id: 'U1', fields: { content: 'Billing API v2 goes live 2026-03-01 (double-checked)' } })
+assert(r.ok)
+r = await call({ action: 'status' })
+record('12t11', r.presets.status === 'stale' && r.tasks.status === 'emitted' && r.tasks.stale === true, 'staleness chain: update_entry -> presets.stale + tasks.stale')
+// restore integrity so the pre-existing interview-reanswer continuation below still runs
+await call({ action: 'attest', verdict: 'ok', ids: ['U1'] })
+r = await call({ action: 'verify' })
+assert(r.passed === true, 'integrity re-passed after the staleness-chain update')
+r = await call({ action: 'crosscheck', verdicts: [
+  { a: 'U1', b: 'U2', verdict: 'consistent', note: 'GA date and idempotency requirement are independent facts, no contradiction' },
+  { a: 'U1', b: 'U3', verdict: 'consistent', note: 'GA date does not constrain the month-end window' },
+  { a: 'U1', b: 'U4', verdict: 'consistent', note: 'sunset is relative to GA, compatible' },
+] })
+assert(r.consistency === 'passed', 'crosscheck re-closed after the staleness-chain update')
 
 // 12c. re-answer the interview -> emitted presets go stale, stage back to presets
 r = await call({ action: 'gate_answer', phase: 'interview', answers: [{ question: 'Roles still migrator + reviewer?', answer: 'add a docs writer, deliver docs too' }], interview: { delivery: ['code', 'docs'], roles: ['migrator', 'reviewer', 'docs-writer'] } })
@@ -255,17 +340,29 @@ record('12c2', r.presets.status === 'stale' && r.stage === 'presets', 're-answer
 const cardsB = cardsA.map(({ write_scope, ...c }) => c)
 r = await call({ action: 'emit_presets', cards: [...cardsB, { role: 'Docs Writer', why: 'the v1 sunset comms and the GA date must reach internal docs', source_entries: ['U4', 'U1'], prompt_body: 'Update internal docs with the v2 GA date (2026-03-01) and the v1 sunset (GA + 6 months).' }] })
 record('12d', r.ok && r.stage === 'plan' && r.emitted === 3 && r.warnings === undefined, 're-emit 3 cards, no scope-overlap warnings -> plan')
-r = await call({ action: 'write_plan', notes_md: 'n2', plan_md: 'p2' })
+r = await call({ action: 'write_plan', notes_md: 'n2', plan_md: 'p2\n\n## Fasi\n\n**Prep (entro 2026-02-20)**\n\n**Migrazione**\n\n**Cutover**\n' })
 {
   const plan = await fs.readFile(path.join(WS, '.doc-workflow/PLAN.md'), 'utf8')
-  record('12e', r.ok && r.stage === 'done' && plan.includes('agents/docs-writer.md'), 're-written PLAN.md lists the new role card')
+  record('12e', r.ok && r.stage === 'tasks' && plan.includes('agents/docs-writer.md'), 're-written PLAN.md lists the new role card, lands on tasks stage (v3.1)')
+  record('12e0', plan.includes('Task drafts: TASKS.md (emitted 3)'), 'PLAN.md pointer reflects the emitted task drafts (§7)')
+}
+// 12e2. re-run emit_tasks from tasks overwrites cleanly: stale cleared, coverage recomputed (§4.7 soft)
+r = await call({ action: 'emit_tasks', tasks: [
+  { subject: 'Wire idempotency keys', description: 'Add the idempotency key header to every POST /v2/invoices caller path; block merges that miss it.', role: 'Reviewer', plan_phase: 'Prep (entro 2026-02-20)' },
+  { subject: 'Migration scripts', description: 'Write reversible v1->v2 invoice migrations, sequenced before cutover; respect the month-end freeze.', role: 'Migrator', plan_phase: 'Migrazione' },
+  { subject: 'Sunset comms', description: 'Announce v1 retirement (GA + 6 months) in internal docs once cutover is scheduled.', role: 'Docs Writer', plan_phase: 'Migrazione' },
+] })
+record('12e2', r.ok && r.stage === 'done' && r.emitted === 3 && Array.isArray(r.warnings) && r.warnings.length === 1 && r.warnings.includes('coverage: plan phase "Cutover" has no task'), 're-emit overwrites, clears stale, soft coverage warning for unreferenced phase')
+{
+  const st = JSON.parse(await fs.readFile(path.join(WS, '.doc-workflow/state.json'), 'utf8'))
+  record('12e3', st.tasks.status === 'emitted' && !st.tasks.stale && st.tasks.items.length === 3, 'state after overwrite: emitted, stale cleared')
 }
 
-// 12f. ingest after done -> presets stale + interview reconfirm armed (assert on state.json)
+// 12f. ingest after done -> presets stale + interview reconfirm armed + tasks staleness chain (§5)
 r = await call({ action: 'ingest', paths: ['docs/new.md'] })
 {
   const st = JSON.parse(await fs.readFile(path.join(WS, '.doc-workflow/state.json'), 'utf8'))
-  record('12f', r.ok && r.stage === 'reading' && st.presets.status === 'stale' && st.gates.interview.reconfirm === true, 'ingest: presets stale + interview reconfirm')
+  record('12f', r.ok && r.stage === 'reading' && st.presets.status === 'stale' && st.gates.interview.reconfirm === true && st.tasks.status === 'emitted' && st.tasks.stale === true, 'ingest: presets stale + interview reconfirm + tasks staleness chain')
 }
 
 // 13. migration of a v1 state (line-only anchor, verification passed) -> stale + indexing + consistency shell
@@ -347,7 +444,57 @@ r = await call({ action: 'ingest', paths: ['docs/new.md'] })
     const plan = await fs.readFile(path.join(WS4, '.doc-workflow/PLAN.md'), 'utf8')
     record('14f', r.ok && r.stage === 'done' && !plan.includes('Delivery & team'), 'answer-only plan written WITHOUT the generated team section')
   }
+  r = await callOn(t4, { action: 'status' })
+  record('14g', r.stage === 'done' && r.tasks.status === 'pending' && r.tasks.count === 0 && r.tasks.stale === false && Array.isArray(r.tasks.warnings) && r.tasks.warnings.length === 0, 'answer-only: still lands done, tasks serialized as pending with empty block (§3)')
   d4.forEach((d) => d())
+}
+
+// 15. synthetic v3 state at stage tasks: skip path + re-run rejection (WS5)
+{
+  const { tool: t5, disposers: d5 } = stubTool(WS5)
+  await fs.mkdir(path.join(WS5, '.doc-workflow'), { recursive: true })
+  await fs.writeFile(path.join(WS5, '.doc-workflow/state.json'), JSON.stringify(v3State()))
+  r = await callOn(t5, { action: 'status' })
+  record('15a', r.ok && r.stage === 'tasks' && r.tasks.status === 'pending' && r.tasks.count === 0 && r.tasks.stale === false && r.tasks.warnings.length === 0, 'v3 tasks state loads, status reports pending tasks (§3)')
+  r = await callOn(t5, { action: 'emit_tasks', tasks: [] })
+  record('15b', r.ok === false && /skip_reason/.test(r.error), 'empty batch without skip_reason rejected (WS5)')
+  r = await callOn(t5, { action: 'emit_tasks', tasks: [], skip_reason: 'single-owner change, tracked outside the board' })
+  record('15c', r.ok && r.stage === 'done' && r.skipped === true, 'emit_tasks skip path with explicit skip_reason -> done')
+  {
+    const tk = await fs.readFile(path.join(WS5, '.doc-workflow/TASKS.md'), 'utf8')
+    record('15d', tk.includes('# Task drafts') && tk.includes('team_task_create') && tk.includes('_Skipped: single-owner change, tracked outside the board_'), 'skipped TASKS.md: header + pointer + _Skipped: reason_ (§6)')
+  }
+  r = await callOn(t5, { action: 'status' })
+  record('15e', r.tasks.status === 'skipped' && r.tasks.skipReason === 'single-owner change, tracked outside the board' && r.tasks.count === 0, 'status tasks skipped + skipReason (camelCase, lead note)')
+  r = await callOn(t5, { action: 'emit_tasks', tasks: [{ subject: 'Late task', description: 'd', role: 'Migrator', plan_phase: 'P' }] })
+  record('15f', r.ok === false && /only allowed at stage/.test(r.error), 'emit_tasks after skip (stage done) rejected as wrong-stage')
+  d5.forEach((d) => d())
+}
+
+// 16. presets skipped at tasks stage: role-source rejection + legal skip (WS6)
+{
+  const { tool: t6, disposers: d6 } = stubTool(WS6)
+  await fs.mkdir(path.join(WS6, '.doc-workflow'), { recursive: true })
+  await fs.writeFile(path.join(WS6, '.doc-workflow/state.json'), JSON.stringify(v3State({ presets: { status: 'skipped', skipReason: 'answer-only', skippedAt: 'x' } })))
+  r = await callOn(t6, { action: 'emit_tasks', tasks: [{ subject: 'Ghost work', description: 'd', role: 'Ghost', plan_phase: 'P' }] })
+  record('16a', r.ok === false && /presets/.test(r.error), 'tasks with skipped presets rejected — no role source (§4.2)')
+  r = await callOn(t6, { action: 'emit_tasks', tasks: [], skip_reason: 'no roles, nothing to draft' })
+  record('16b', r.ok && r.stage === 'done' && r.skipped === true, 'skipped presets -> tasks skipped with skip_reason')
+  d6.forEach((d) => d())
+}
+
+// 17. legacy v3 state at stage done (no tasks block): accepted as-is, no retro-demotion (WS7)
+{
+  const { tool: t7, disposers: d7 } = stubTool(WS7)
+  await fs.mkdir(path.join(WS7, '.doc-workflow'), { recursive: true })
+  await fs.writeFile(path.join(WS7, '.doc-workflow/state.json'), JSON.stringify(v3State({ stage: 'done' })))
+  r = await callOn(t7, { action: 'status' })
+  record('17a', r.ok && r.stage === 'done' && r.tasks.status === 'pending' && r.tasks.count === 0, 'legacy v3 done without tasks block loads untouched, status synthesizes pending (§1)')
+  {
+    const st = JSON.parse(await fs.readFile(path.join(WS7, '.doc-workflow/state.json'), 'utf8'))
+    record('17b', st.version === 3 && st.stage === 'done' && st.tasks === undefined, 'no retro-write: persisted state keeps version 3, done, no tasks field (§2 additive)')
+  }
+  d7.forEach((d) => d())
 }
 
 console.log(results.join('\n'))

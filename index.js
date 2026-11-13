@@ -10,7 +10,9 @@
  * INTERVIEW gate (the user confirms the agent roles + delivery type proposed
  * from the verified index) -> agent role presets: source-backed markdown
  * cards under agents/ + PRESETS.md, or an explicit skip for answer-only
- * objectives -> notes + plan. Incremental input of new documents re-enters
+ * objectives -> notes + plan -> team task drafts: emit_tasks renders TASKS.md,
+ * 1:1 mappable to the shared team task board, or records an explicit skip.
+ * Incremental input of new documents re-enters
  * the reading stage and re-arms the interview.
  *
  * All state lives in the session workspace under a per-session folder so the
@@ -144,7 +146,11 @@ function afterGapsAnswered(state) {
 
 /** any edit that invalidates verification also invalidates emitted role cards */
 function presetsStale(state) {
-  if (state.presets && state.presets.status === 'emitted') state.presets.status = 'stale'
+  if (state.presets && state.presets.status === 'emitted') {
+    state.presets.status = 'stale'
+    // v3.1: task drafts derive from the cards — keep the invalidation chain visible
+    if (state.tasks && state.tasks.status === 'emitted') state.tasks.stale = true
+  }
 }
 
 /** drop verdicts touching a changed/removed entry so its pairs must be re-reviewed */
@@ -379,8 +385,15 @@ function guidanceFor(state) {
       break
     case 'plan':
       g.push('All gates satisfied. Write the notes and the plan to reach the objective, then call action=write_plan with notes_md and plan_md (markdown). They are saved to NOTES.md and PLAN.md.')
-      if (state.presets && state.presets.status === 'emitted')
+      if (state.presets && state.presets.status === 'emitted') {
         g.push('Reference the emitted role cards (agents/*.md) in the plan team section; write_plan appends the generated "Delivery & team (generated)" section.')
+        g.push('With presets emitted write_plan lands on the tasks stage: draft the team tasks there with emit_tasks.')
+      }
+      break
+    case 'tasks':
+      g.push('WRITE THE TASK DRAFTS: one team task per unit of work from the plan, each assigned to a confirmed role (exact card name) and tagged with a PLAN.md phase. Call action=emit_tasks tasks=[{subject, description, role, plan_phase, write_scopes?, blocked_by?}] — rendered to TASKS.md, 1:1 mappable to team_task_create.')
+      g.push('blocked_by may only reference other tasks in the same batch; write_scopes default to the role card write_scope.')
+      g.push('If no task drafts make sense, call emit_tasks with tasks=[] plus skip_reason.')
       break
     case 'done':
       g.push('Workflow complete. If new documents arrive, use action=ingest to re-enter the loop.')
@@ -419,6 +432,15 @@ function statusPayload(state, dirAbs) {
       cards: (state.presets.cards || []).map((c) => ({ role: c.role, source_entries: c.source_entries })),
       ...(state.presets.skipReason ? { skip_reason: state.presets.skipReason } : {}),
     },
+    // v3.1: expose the tasks block as-is (camelCase per DESIGN §2) + count for chips
+    tasks: state.tasks
+      ? {
+          ...state.tasks,
+          stale: !!state.tasks.stale,
+          warnings: state.tasks.warnings || [],
+          count: Array.isArray(state.tasks.items) ? state.tasks.items.length : 0,
+        }
+      : { status: 'pending', stale: false, warnings: [], count: 0 },
     verification: state.verification.status,
     verified: overallVerified(state),
     consistency: (() => {
@@ -561,6 +583,105 @@ function scopeOverlap(a, b) {
 }
 
 // ---------------------------------------------------------------------------
+// team task drafts (emit_tasks) — v3.1 "Team bridge"
+// ---------------------------------------------------------------------------
+
+function taskSlug(subject) {
+  const s = String(subject).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  return s || 'task'
+}
+
+/** collision-suffixed slug (same convention as preset slugs: -2, -3, …); registers it in `used` */
+function uniqueSlug(base, used) {
+  let s = base
+  let k = 2
+  while (used.has(s)) s = `${base}-${k++}`
+  used.add(s)
+  return s
+}
+
+/**
+ * PLAN.md phase markers (DESIGN §4.7): bold-only `**…**` lines under a heading
+ * whose text contains "Fasi"/"Phases", plus `###` headings anywhere.
+ */
+function planPhaseMarkers(planText) {
+  const out = []
+  let inSection = false
+  let fence = false
+  for (const line of String(planText).split(/\r?\n/)) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      fence = !fence
+      continue
+    }
+    if (fence) continue
+    const h = /^(#{1,6})\s+(.+?)\s*$/.exec(line)
+    if (h) {
+      const lvl = h[1].length
+      const text = h[2].replace(/\*\*/g, '').trim()
+      if (lvl === 3) out.push(text)
+      if (lvl <= 2) inSection = /fasi|phases/i.test(text)
+      continue
+    }
+    if (!inSection) continue
+    const b = /^\s*\*\*([^*]+)\*\*:?\s*$/.exec(line)
+    if (b) out.push(b[1].trim())
+  }
+  return [...new Set(out.filter((s) => s !== ''))]
+}
+
+/** first cycle path [a, b, …, a] in a blocked_by graph (self-reference included), else null */
+function findBlockedCycle(deps) {
+  const mark = new Map() // id -> 1 on recursion stack, 2 fully explored
+  const stack = []
+  let found = null
+  const visit = (id) => {
+    if (found) return
+    const m = mark.get(id)
+    if (m === 1) {
+      found = [...stack.slice(stack.indexOf(id)), id]
+      return
+    }
+    if (m === 2) return
+    mark.set(id, 1)
+    stack.push(id)
+    for (const d of deps.get(id) || []) {
+      visit(d)
+      if (found) return
+    }
+    stack.pop()
+    mark.set(id, 2)
+  }
+  for (const id of deps.keys()) {
+    visit(id)
+    if (found) return found
+  }
+  return null
+}
+
+/** TASKS.md rendering (DESIGN §6) — the state.json "tasks" block stays authoritative */
+function tasksDoc(state) {
+  const t = state.tasks
+  let md =
+    '# Task drafts\n\n' +
+    '<!-- machine consumers: state.json "tasks" block is authoritative -->\n\n' +
+    'Each item maps 1:1 to a team_task_create call (subject/description/blocked_by/write_scopes).\n'
+  if (t && t.status === 'skipped') return `${md}\n_Skipped: ${t.skipReason}_\n`
+  for (const it of (t && t.items) || []) {
+    md += `\n## ${it.subject}\n\n- **role**: ${it.role} · **plan phase**: ${it.plan_phase}\n`
+    md += `- **write_scopes**: ${it.write_scopes.length ? it.write_scopes.map((s) => '`' + s + '`').join(', ') : '—'}\n`
+    md += `- **blocked_by**: ${it.blocked_by.length ? it.blocked_by.join(', ') : 'none'}\n\n${it.description}\n`
+  }
+  return md
+}
+
+/** write_plan pointer value (DESIGN §7) */
+function tasksPointer(state) {
+  const t = state.tasks
+  if (!t) return 'pending'
+  return t.status === 'emitted' ? `emitted ${(t.items || []).length}` : 'skipped'
+}
+
+// ---------------------------------------------------------------------------
 // tool implementation
 // ---------------------------------------------------------------------------
 
@@ -659,7 +780,7 @@ async function runDocflow(ctx, exec, args) {
         md += `- **Interview result**: ${iv.answer_only === true ? 'answer-only (analysis, no execution roles)' : `delivery=${iv.delivery.join('+')}; roles=${iv.roles.map((r) => r.trim()).join(', ')}`}\n`
       await appendMd(file, md)
       if (phase === 'interview') {
-        if (state.presets.status === 'emitted') state.presets.status = 'stale'
+        presetsStale(state)
         const answerOnly = iv.answer_only === true
         state.interview = {
           answerOnly,
@@ -953,6 +1074,89 @@ async function runDocflow(ctx, exec, args) {
       }
     }
 
+    case 'emit_tasks': {
+      if (state.stage !== 'tasks') return fail(`emit_tasks is only allowed at stage "tasks" (current: ${state.stage}).`, guidanceFor(state).join(' '))
+      const skipReason = typeof args.skip_reason === 'string' ? args.skip_reason.trim() : ''
+      const rawTasks = Array.isArray(args.tasks) ? args.tasks : []
+      if (rawTasks.length === 0 && !skipReason)
+        return fail('emit_tasks requires a non-empty tasks array — an empty batch is admissible only with skip_reason.', 'Draft one task per unit of work (subject, description, role, plan_phase), or call emit_tasks with tasks=[] and skip_reason when no drafts make sense.')
+      if (rawTasks.length > 0 && state.presets.status !== 'emitted')
+        return fail(`emit_tasks needs emitted presets: task roles come from the emitted cards (current presets status: ${state.presets.status}).`, 'Re-emit the role cards and re-run write_plan first — or call emit_tasks with tasks=[] and skip_reason: a skipped-presets flow must skip the task drafts too.')
+      if (rawTasks.length === 0) {
+        // explicit skip (DESIGN §5): mirrors the presets skip semantics
+        state.tasks = { status: 'skipped', skippedAt: now(), skipReason }
+        state.stage = 'done'
+        const skipFile = path.join(dirAbs, 'TASKS.md')
+        await fs.writeFile(skipFile, tasksDoc(state), 'utf8')
+        await writeJson(path.join(dirAbs, 'state.json'), state)
+        await renderIndex(dirAbs, state)
+        return { ok: true, stage: 'done', skipped: true, tasks_file: skipFile, next: guidanceFor(state) }
+      }
+      const cards = state.presets.cards || []
+      const cardByRole = new Map(cards.map((c) => [c.role, c]))
+      const drafts = []
+      const usedIds = new Set()
+      for (const raw of rawTasks) {
+        const subject = typeof raw.subject === 'string' ? raw.subject.trim() : ''
+        if (subject === '') return fail('Each task needs a non-empty subject.')
+        const description = typeof raw.description === 'string' ? raw.description.trim() : ''
+        if (description === '') return fail(`Task "${subject}": description is required — it maps 1:1 to the team_task body.`)
+        const planPhase = typeof raw.plan_phase === 'string' ? raw.plan_phase.trim() : ''
+        if (planPhase === '') return fail(`Task "${subject}": plan_phase is required — tag the task with a PLAN.md phase.`)
+        const role = typeof raw.role === 'string' ? raw.role.trim() : ''
+        if (!cardByRole.has(role))
+          return fail(`Task "${subject}": unknown role "${role}". Valid roles from the emitted cards: ${cards.map((c) => c.role).join(', ')}.`)
+        const id = uniqueSlug(taskSlug(subject), usedIds)
+        let writeScopes
+        if (Array.isArray(raw.write_scopes)) {
+          writeScopes = raw.write_scopes.map((s) => String(s).trim())
+          if (writeScopes.some((s) => s === '')) return fail(`Task "${subject}": write_scopes entries must be non-empty strings.`)
+        } else {
+          // absent -> inherit the card's write_scope verbatim (may be [])
+          writeScopes = (cardByRole.get(role).write_scope || []).slice()
+        }
+        const blockedBy = Array.isArray(raw.blocked_by) ? [...new Set(raw.blocked_by.map((b) => String(b).trim()))] : []
+        drafts.push({ id, subject, description, role, plan_phase: planPhase, write_scopes: writeScopes, blocked_by: blockedBy })
+      }
+      const ids = new Set(drafts.map((d) => d.id))
+      for (const d of drafts) {
+        for (const b of d.blocked_by) {
+          if (!ids.has(b))
+            return fail(`Task "${d.subject}": blocked_by references "${b}", which is not an id in this batch. Valid ids: ${[...ids].join(', ')}.`)
+        }
+      }
+      const cycle = findBlockedCycle(new Map(drafts.map((d) => [d.id, d.blocked_by])))
+      if (cycle)
+        return fail(`blocked_by cycle: ${cycle.join(' → ')} — references must stay acyclic (self-references included).`, 'Reorder the drafts: blocked_by may only point at other tasks in this batch without closing a loop.')
+      // soft coverage warnings (DESIGN §4.7): never blocking
+      const warnings = []
+      let markers = []
+      try {
+        markers = planPhaseMarkers(await fs.readFile(path.join(dirAbs, 'PLAN.md'), 'utf8'))
+      } catch {}
+      if (markers.length === 0) {
+        warnings.push('coverage: PLAN.md phase markers not found')
+      } else {
+        const norm = (s) => normSpace(s).toLowerCase()
+        const referenced = new Set(drafts.map((d) => norm(d.plan_phase)))
+        for (const m of markers) if (!referenced.has(norm(m))) warnings.push(`coverage: plan phase "${m}" has no task`)
+      }
+      state.tasks = { status: 'emitted', emittedAt: now(), items: drafts, warnings }
+      state.stage = 'done'
+      const tasksFile = path.join(dirAbs, 'TASKS.md')
+      await fs.writeFile(tasksFile, tasksDoc(state), 'utf8')
+      await writeJson(path.join(dirAbs, 'state.json'), state)
+      await renderIndex(dirAbs, state)
+      return {
+        ok: true,
+        stage: 'done',
+        emitted: drafts.length,
+        tasks_file: tasksFile,
+        ...(warnings.length ? { warnings } : {}),
+        next: guidanceFor(state),
+      }
+    }
+
     case 'ingest': {
       if (!Array.isArray(args.paths) || args.paths.length === 0) return fail('ingest requires paths: new or changed documents.')
       state.pendingDocs = [...new Set([...(state.pendingDocs || []), ...args.paths])]
@@ -974,17 +1178,18 @@ async function runDocflow(ctx, exec, args) {
       if (state.presets.status === 'emitted') {
         planDoc += `\n## Delivery & team (generated)\n\nDelivery: ${(state.interview.delivery || []).join(', ') || 'answer-only'}\n\n`
         for (const c of state.presets.cards) planDoc += `- **${c.role}** — role card: ${c.file}\n`
+        planDoc += `- Task drafts: TASKS.md (${tasksPointer(state)})\n`
       }
       await fs.writeFile(path.join(dirAbs, 'PLAN.md'), planDoc, 'utf8')
       state.plan = { writtenAt: now(), notes: 'NOTES.md', plan: 'PLAN.md' }
-      state.stage = 'done'
+      state.stage = state.presets.status === 'emitted' ? 'tasks' : 'done'
       await writeJson(path.join(dirAbs, 'state.json'), state)
       await renderIndex(dirAbs, state)
-      return { ok: true, stage: 'done', notes: path.join(dirAbs, 'NOTES.md'), plan: path.join(dirAbs, 'PLAN.md'), next: guidanceFor(state) }
+      return { ok: true, stage: state.stage, notes: path.join(dirAbs, 'NOTES.md'), plan: path.join(dirAbs, 'PLAN.md'), next: guidanceFor(state) }
     }
 
     default:
-      return fail(`Unknown action ${action}.`, 'Actions: status, start, gate_ask, gate_answer, add_entries, update_entry, remove_entry, attest, verify, crosscheck, emit_presets, ingest, write_plan, reset.')
+      return fail(`Unknown action ${action}.`, 'Actions: status, start, gate_ask, gate_answer, add_entries, update_entry, remove_entry, attest, verify, crosscheck, emit_presets, emit_tasks, ingest, write_plan, reset.')
   }
 }
 
@@ -997,14 +1202,14 @@ function makeTool(ctx) {
     name: 'docflow',
   description:
     'Document-driven workflow engine for project work: turn project documents into a source-verified index and a plan. ' +
-    'Stage machine: start(objective, doc_roots) -> read docs -> understanding gate (ask the user via ask_user_question, then gate_ask/gate_answer phase=understanding) -> add_entries (useful/not-useful filtered info; every entry MUST carry a verbatim source_quote plus source_kind "doc" (project source_file) or "external" (source_ref URL/path) — assumed content is rejected) -> attest(ok|suspect; trusted for external sources after human review) trustworthiness -> verify = INTEGRITY check (source readable + quote found verbatim; unvouched external sources keep it from passing; failures send you back to re-read and fix) -> CONSISTENCY phase: crosscheck records one verdict per pair of useful entries (consistent|conflict); conflicts block the workflow until the entries are corrected and re-reviewed -> gaps gate (ask the user what information is missing to reach the objective, phase=gaps) -> interview gate (phase=interview: propose the agent roles + delivery type code/docs/answer-only, the user confirms via gate_answer with the interview payload) -> emit_presets writes source-backed agent role cards under agents/ + PRESETS.md (answer-only skips presets explicitly) -> write_plan(notes_md, plan_md). ' +
-    'New documents arrive via ingest and re-enter the loop. status returns the current stage, gate/verification/consistency state and the exact next steps — follow its "next" guidance. The workflow state lives in a .doc-workflow/ folder in the session workspace (objective.md, index.md, questions-*.md, verification.md, consistency.md, agents/<role>.md, PRESETS.md, NOTES.md, PLAN.md). Use this tool whenever asked to analyze project documents toward an objective, build/update index.md, verify source reliability or logical coherence, or write notes/plan from documentation.',
+    'Stage machine: start(objective, doc_roots) -> read docs -> understanding gate (ask the user via ask_user_question, then gate_ask/gate_answer phase=understanding) -> add_entries (useful/not-useful filtered info; every entry MUST carry a verbatim source_quote plus source_kind "doc" (project source_file) or "external" (source_ref URL/path) — assumed content is rejected) -> attest(ok|suspect; trusted for external sources after human review) trustworthiness -> verify = INTEGRITY check (source readable + quote found verbatim; unvouched external sources keep it from passing; failures send you back to re-read and fix) -> CONSISTENCY phase: crosscheck records one verdict per pair of useful entries (consistent|conflict); conflicts block the workflow until the entries are corrected and re-reviewed -> gaps gate (ask the user what information is missing to reach the objective, phase=gaps) -> interview gate (phase=interview: propose the agent roles + delivery type code/docs/answer-only, the user confirms via gate_answer with the interview payload) -> emit_presets writes source-backed agent role cards under agents/ + PRESETS.md (answer-only skips presets explicitly) -> write_plan(notes_md, plan_md) -> emit_tasks (TEAM BRIDGE, only when presets were emitted): team task drafts rendered to TASKS.md, each 1:1 mappable to team_task_create (subject/description/role/plan_phase/write_scopes/blocked_by), or an explicit skip via tasks=[] + skip_reason. ' +
+    'New documents arrive via ingest and re-enter the loop. status returns the current stage, gate/verification/consistency state and the exact next steps — follow its "next" guidance. The workflow state lives in a .doc-workflow/ folder in the session workspace (objective.md, index.md, questions-*.md, verification.md, consistency.md, agents/<role>.md, PRESETS.md, NOTES.md, PLAN.md, TASKS.md). Use this tool whenever asked to analyze project documents toward an objective, build/update index.md, verify source reliability or logical coherence, or write notes/plan from documentation.',
   parameters: {
     type: 'object',
     properties: {
       action: {
         type: 'string',
-        enum: ['status', 'start', 'gate_ask', 'gate_answer', 'add_entries', 'update_entry', 'remove_entry', 'attest', 'verify', 'crosscheck', 'emit_presets', 'ingest', 'write_plan', 'reset'],
+        enum: ['status', 'start', 'gate_ask', 'gate_answer', 'add_entries', 'update_entry', 'remove_entry', 'attest', 'verify', 'crosscheck', 'emit_presets', 'emit_tasks', 'ingest', 'write_plan', 'reset'],
       },
       objective: { type: 'string', description: 'start: the work objective as defined by the user.' },
       doc_roots: { type: 'array', items: { type: 'string' }, description: 'start: documents/directories to read.' },
@@ -1036,6 +1241,23 @@ function makeTool(ctx) {
         },
         description: 'emit_presets: one source-backed agent role card per confirmed role.',
       },
+      tasks: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            subject: { type: 'string', description: 'task title; the id is slug(subject) with -2/-3 collision suffixes.' },
+            description: { type: 'string', description: 'the team_task body — kept verbatim in TASKS.md and in the state items.' },
+            role: { type: 'string', description: 'exact role name from the emitted presets cards.' },
+            plan_phase: { type: 'string', description: 'the PLAN.md phase this task belongs to (bold **…** phase or ### heading).' },
+            write_scopes: { type: 'array', items: { type: 'string' }, description: 'optional; when absent the role card write_scope is inherited verbatim.' },
+            blocked_by: { type: 'array', items: { type: 'string' }, description: 'ids of other tasks in this batch; self-references and cycles are rejected.' },
+          },
+          required: ['subject', 'description', 'role', 'plan_phase'],
+        },
+        description: 'emit_tasks: one draft per unit of work; the array may be empty only together with skip_reason.',
+      },
+      skip_reason: { type: 'string', description: 'emit_tasks: explicit skip when no task drafts make sense (mirrors the presets skip semantics).' },
       entries: {
         type: 'array',
         items: {
@@ -1108,7 +1330,7 @@ const PROMPT_SECTION = {
   text:
     '## Document workflow (docflow)\n' +
     'When a task means understanding or planning work from local project documents (analyze docs toward an objective, build index.md, verify information trustworthiness, write notes/plan), drive the flow with the `docflow` tool instead of ad-hoc notes. ' +
-    'It enforces the loop: objective -> read -> ask the user the understanding questions (ask_user_question) -> filter info into useful/not-useful entries, each source-backed with a verbatim quote (internal doc file or declared external source — never assumed) -> attest + verify INTEGRITY (re-read failures) -> CONSISTENCY: cross-check every pair of useful entries with crosscheck verdicts and resolve conflicts -> ask the user about missing information -> interview gate: propose the agent roles + delivery type (code/docs/answer-only), the user confirms, then emit_presets writes the source-backed role cards (agents/*.md + PRESETS.md) -> notes + plan. ' +
+    'It enforces the loop: objective -> read -> ask the user the understanding questions (ask_user_question) -> filter info into useful/not-useful entries, each source-backed with a verbatim quote (internal doc file or declared external source — never assumed) -> attest + verify INTEGRITY (re-read failures) -> CONSISTENCY: cross-check every pair of useful entries with crosscheck verdicts and resolve conflicts -> ask the user about missing information -> interview gate: propose the agent roles + delivery type (code/docs/answer-only), the user confirms, then emit_presets writes the source-backed role cards (agents/*.md + PRESETS.md) -> notes + plan -> when presets were emitted, emit_tasks drafts the team tasks from the plan (TASKS.md, 1:1 mappable to team_task_create) or records an explicit skip. ' +
     'Whenever docflow returns "next" guidance, follow it literally.',
 }
 
