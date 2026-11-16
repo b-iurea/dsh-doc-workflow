@@ -209,6 +209,10 @@ function migrateState(state) {
       dirty = true
     }
   }
+  if (!Array.isArray(state.discoveredDocs)) {
+    state.discoveredDocs = []
+    dirty = true
+  }
   if (state.version !== STATE_VERSION) {
     if (state.version < 2) {
       // v1 trusted "line anchor, no quote" and had no consistency phase: force re-check
@@ -348,6 +352,11 @@ async function renderIndex(dirAbs, state) {
     for (const p of state.pendingDocs) out.push(`- \`${p}\``)
     out.push('')
   }
+  if (state.discoveredDocs && state.discoveredDocs.length) {
+    out.push('## Discovered — new/changed files not yet ingested', '')
+    for (const d of state.discoveredDocs) out.push(`- \`${d.path}\` (${d.kind}, seen ${d.seenAt})`)
+    out.push('')
+  }
   await fs.writeFile(path.join(dirAbs, 'index.md'), out.join('\n'), 'utf8')
 }
 
@@ -412,6 +421,10 @@ function guidanceFor(state) {
     default:
       g.push('Call action=start with the objective and doc_roots.')
   }
+  if (state.discoveredDocs && state.discoveredDocs.length) {
+    const list = state.discoveredDocs.map((d) => `\`${d.path}\` (${d.kind})`).join(', ')
+    g.push(`AUTO-DISCOVERY: ${state.discoveredDocs.length} file(s) under doc_roots are new or changed since the last ingest — ${list}. Surface this to the user and, once they acknowledge, call action=ingest with these paths to enter them in the flow. Do not ingest without the user's acknowledgement.`)
+  }
   return g
 }
 
@@ -461,6 +474,17 @@ function statusPayload(state, dirAbs) {
       return { status: state.consistency.status, pairs: cl.pairs.length, missing: cl.missing, conflicts: cl.conflicts }
     })(),
     pending_docs: state.pendingDocs || [],
+    // v1.3.2 (issue #11): files discovered by the last scan, awaiting ingest.
+    discovered: (state.discoveredDocs || []).map((d) => ({ path: d.path, kind: d.kind, seen_at: d.seenAt })),
+    ...(state.docSnapshot
+      ? {
+          doc_snapshot: {
+            taken_at: state.docSnapshot.takenAt,
+            files: Object.keys(state.docSnapshot.files || {}).length,
+            ...(state.docSnapshot.truncated ? { truncated: true } : {}),
+          },
+        }
+      : {}),
     next: guidanceFor(state),
   }
   if (state.plan && state.plan.writtenAt) payload.plan = { notes: path.join(dirAbs, 'NOTES.md'), plan: path.join(dirAbs, 'PLAN.md') }
@@ -486,10 +510,109 @@ function freshState(objective, docRoots, dirName) {
     consistency: { status: 'n/a', verdicts: {}, updatedAt: undefined },
     entries: {},
     pendingDocs: [],
+    // v1.3.2 (issue #11): mtime/size manifest of doc_roots taken at start/ingest, plus the
+    // auto-discovered new/changed files still waiting for an ingest acknowledgement.
+    docSnapshot: null,
+    discoveredDocs: [],
     plan: {},
     createdAt: now(),
     updatedAt: now(),
   }
+}
+
+// ---------------------------------------------------------------------------
+// v1.3.2 (issue #11): auto-discovery of new/changed files under doc_roots
+// ---------------------------------------------------------------------------
+
+const SCAN_FILE_CAP = 2000
+
+function relPath(cwd, abs) {
+  return path.relative(cwd, abs).split(path.sep).join('/')
+}
+
+/** mtime/size manifest of one root (file root = itself; dir root = bounded recursive walk). */
+async function scanRootFiles(abs, cwd, files, counter) {
+  let st
+  try {
+    st = await fs.stat(abs)
+  } catch {
+    return
+  }
+  if (st.isFile()) {
+    files[relPath(cwd, abs)] = { m: Math.floor(st.mtimeMs), s: st.size }
+    return
+  }
+  if (!st.isDirectory()) return
+  const stack = [abs]
+  while (stack.length) {
+    const dir = stack.pop()
+    let ents
+    try {
+      ents = await fs.readdir(dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const ent of ents) {
+      if (counter.n >= SCAN_FILE_CAP) {
+        counter.truncated = true
+        return
+      }
+      const child = path.join(dir, ent.name)
+      if (ent.isDirectory()) {
+        if (ent.name.startsWith('.') || ent.name === 'node_modules') continue
+        stack.push(child)
+      } else if (ent.isFile()) {
+        let fst
+        try {
+          fst = await fs.stat(child)
+        } catch {
+          continue
+        }
+        files[relPath(cwd, child)] = { m: Math.floor(fst.mtimeMs), s: fst.size }
+        counter.n++
+      }
+    }
+  }
+}
+
+async function snapshotDocRoots(cwd, docRoots) {
+  const files = {}
+  const counter = { n: 0, truncated: false }
+  for (const root of docRoots || []) await scanRootFiles(path.resolve(cwd, root), cwd, files, counter)
+  return { files, truncated: counter.truncated }
+}
+
+/** Diff the live scan against the stored snapshot; keep seenAt stable for repeated discoveries. */
+function applyDiscovery(state, scan) {
+  const prev = (state.docSnapshot && state.docSnapshot.files) || {}
+  const found = []
+  for (const [p, v] of Object.entries(scan.files)) {
+    const old = prev[p]
+    if (!old) found.push({ path: p, kind: 'new' })
+    else if (old.m !== v.m || old.s !== v.s) found.push({ path: p, kind: 'changed' })
+  }
+  found.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  const was = {}
+  for (const d of state.discoveredDocs || []) was[d.path] = d
+  state.discoveredDocs = found.map((f) => ({ path: f.path, kind: f.kind, seenAt: (was[f.path] || {}).seenAt || now() }))
+}
+
+/**
+ * Re-scan doc_roots and refresh state.discoveredDocs. The first call on a pre-v1.3.2
+ * workflow only takes the baseline (already-read docs must not flood the notice).
+ * Returns true when state changed enough to be worth persisting.
+ */
+async function discoverDocs(cwd, state) {
+  if (!state.docSnapshot) {
+    const scan = await snapshotDocRoots(cwd, state.doc_roots)
+    state.docSnapshot = { takenAt: now(), files: scan.files, truncated: scan.truncated }
+    state.discoveredDocs = []
+    return true
+  }
+  const before = (state.discoveredDocs || []).map((d) => `${d.path}:${d.kind}`).join('|')
+  const scan = await snapshotDocRoots(cwd, state.doc_roots)
+  applyDiscovery(state, scan)
+  return before !== state.discoveredDocs.map((d) => `${d.path}:${d.kind}`).join('|')
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +847,9 @@ async function runDocflow(ctx, exec, args) {
         'utf8',
       )
       for (const gd of Object.values(GATE_DOCS)) await fs.writeFile(path.join(startAbs, gd.file), gd.header, 'utf8')
+      // v1.3.2 (issue #11): baseline manifest — everything under doc_roots at start is "already known".
+      const baseScan = await snapshotDocRoots(cwd, st.doc_roots)
+      st.docSnapshot = { takenAt: now(), files: baseScan.files, truncated: baseScan.truncated }
       await writeJson(path.join(startAbs, 'state.json'), st)
       await renderIndex(startAbs, st)
       return { ok: true, stage: st.stage, folder: startAbs, next: guidanceFor(st) }
@@ -736,6 +862,12 @@ async function runDocflow(ctx, exec, args) {
           stage: 'no-workflow',
           next: 'Call action=start with objective (as defined by the user) and doc_roots (documents/directories to read). If the objective is not clear from the conversation, ask the user first.',
         }
+      // v1.3.2 (issue #11): on-demand auto-discovery — every status call diffs doc_roots
+      // against the last snapshot and keeps notifying until the files are ingested.
+      if (await discoverDocs(cwd, state)) {
+        await writeJson(path.join(dirAbs, 'state.json'), state)
+        await renderIndex(dirAbs, state)
+      }
       return statusPayload(state, dirAbs)
 
     case 'reset': {
@@ -1274,6 +1406,24 @@ async function runDocflow(ctx, exec, args) {
     case 'ingest': {
       if (!Array.isArray(args.paths) || args.paths.length === 0) return fail('ingest requires paths: new or changed documents.')
       state.pendingDocs = [...new Set([...(state.pendingDocs || []), ...args.paths])]
+      // v1.3.2 (issue #11): the ingest acknowledges the listed files — they become part of
+      // the snapshot and leave the discovered list; other discoveries keep notifying.
+      if (state.docSnapshot) {
+        const norm = (p) => String(p).split(path.sep).join('/')
+        const ingested = args.paths.map(norm)
+        const under = (p) => ingested.some((ip) => p === ip || p.startsWith(ip + '/'))
+        const scan = await snapshotDocRoots(cwd, state.doc_roots)
+        for (const [p, v] of Object.entries(scan.files)) if (under(p)) state.docSnapshot.files[p] = v
+        for (const p of ingested) {
+          const abs = path.resolve(cwd, p)
+          try {
+            const fst = await fs.stat(abs)
+            if (fst.isFile()) state.docSnapshot.files[norm(p)] = { m: Math.floor(fst.mtimeMs), s: fst.size }
+          } catch {}
+        }
+        state.docSnapshot.takenAt = now()
+        state.discoveredDocs = (state.discoveredDocs || []).filter((d) => !under(d.path))
+      }
       state.stage = 'reading'
       state.verification.status = 'unverified'
       state.gates.understanding.reconfirm = state.gates.understanding.status === 'answered'
@@ -1317,7 +1467,7 @@ function makeTool(ctx) {
   description:
     'Document-driven workflow engine for project work: turn project documents into a source-verified index and a plan. ' +
     'Stage machine: start(objective, doc_roots) -> read docs -> understanding gate (ask the user via ask_user_question, then gate_ask/gate_answer phase=understanding) -> add_entries (useful/not-useful filtered info; every entry MUST carry a verbatim source_quote plus source_kind "doc" (project source_file) or "external" (source_ref URL/path) — assumed content is rejected) -> attest(ok|suspect; trusted for external sources after human review) trustworthiness -> verify = INTEGRITY check (source readable + quote found verbatim; unvouched external sources keep it from passing; failures send you back to re-read and fix) -> CONSISTENCY phase: crosscheck records one verdict per pair of useful entries (consistent|conflict); conflicts block the workflow until the entries are corrected and re-reviewed -> gaps gate (ask the user what information is missing to reach the objective, phase=gaps) -> interview gate (phase=interview: propose the agent roles + delivery type code/docs/answer-only, the user confirms via gate_answer with the interview payload) -> emit_presets writes source-backed agent role cards under agents/ + PRESETS.md (answer-only skips presets explicitly) -> write_plan(notes_md, plan_md) -> emit_tasks (TEAM BRIDGE, only when presets were emitted): team task drafts rendered to TASKS.md, each 1:1 mappable to team_task_create (subject/description/role/plan_phase/write_scopes/blocked_by), or an explicit skip via tasks=[] + skip_reason -> reflow(to_stage): re-run any step at or upstream of the current stage, invalidating downstream artifacts (entries and gates history are never silently dropped). ' +
-    'New documents arrive via ingest and re-enter the loop. status returns the current stage, gate/verification/consistency state and the exact next steps — follow its "next" guidance. The workflow state lives in a .doc-workflow/ folder in the session workspace (objective.md, index.md, questions-*.md, verification.md, consistency.md, agents/<role>.md, PRESETS.md, NOTES.md, PLAN.md, TASKS.md). Use this tool whenever asked to analyze project documents toward an objective, build/update index.md, verify source reliability or logical coherence, or write notes/plan from documentation.',
+    'New documents arrive via ingest and re-enter the loop. status auto-discovers files under doc_roots that are new or changed since the last ingest (diffs an mtime/size manifest, on demand — no background polling) and keeps surfacing them in "discovered" + next guidance until you acknowledge with ingest; pre-ingest discovery never enters the flow by itself. status returns the current stage, gate/verification/consistency state and the exact next steps — follow its "next" guidance. The workflow state lives in a .doc-workflow/ folder in the session workspace (objective.md, index.md, questions-*.md, verification.md, consistency.md, agents/<role>.md, PRESETS.md, NOTES.md, PLAN.md, TASKS.md). Use this tool whenever asked to analyze project documents toward an objective, build/update index.md, verify source reliability or logical coherence, or write notes/plan from documentation.',
   parameters: {
     type: 'object',
     properties: {

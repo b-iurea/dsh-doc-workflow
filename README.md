@@ -32,6 +32,7 @@ flowchart TD
     T -. "reflow(to_stage): restart from any step ≤ current,<br>downstream artifacts invalidated" .-> B
 ```
 
+- **Auto-discovery (v1.3.2)**: documents rarely announce themselves. Every `docflow status` diffs the `doc_roots` against a lightweight mtime/size manifest (taken at `start`, refreshed at `ingest`) and reports `discovered`: files that appeared or changed since the last acknowledgement. They surface in the panel and in the agent's `next` guidance, and they **keep notifying until you acknowledge** — entering the flow still requires an explicit `ingest`, so nothing gets read into the workflow behind your back. No background polling: the diff runs on demand at status/panel refresh.
 - **Reflow (v1.3.1)**: a workflow rarely needs a full reset — usually just one step has to be redone. `docflow reflow to_stage=<step>` restarts from any step at or upstream of the current stage (never forward, never the objective itself) and invalidates exactly the downstream artifacts per a fixed effect matrix: re-running `indexing` clears the verification + verdicts, re-running `gaps` re-opens the gaps gate and marks the interview for reconfirmation, re-running `presets` demands a fresh `emit_presets` before the plan can be written again, and so on — while the objective, the extracted entries and every gate's history are **never** silently dropped. The panel's stage rail turns each reachable step into a clickable box showing what that step last produced, with a **"Resume from here"** button that injects the reflow request straight back into the chat (the agent runs `docflow reflow` and continues; copy-paste fallback only if the session is not live).
 - **Comprehension gate** (red line 1): before extracting anything, the agent must ask you what is ambiguous about the objective *given these documents*, and you must answer.
 - **Two scrapes**: useful entries (`U1…`) and explicitly rejected ones (`N1…`) both land in `index.md`, so the filtering is reviewable, not invisible.
@@ -98,6 +99,7 @@ icon.svg              tab/plugin icon
 DESIGN-v3.md          implementation contract for the interview/presets (v3) flow
 DESIGN-v3.1.md        implementation contract for emit_tasks / task drafts (v3.1)
 DESIGN-v1.3.1.md      implementation contract for reflow / step-level restart (v1.3.1)
+DESIGN-v1.3.2.md      implementation contract for auto-discovery of new/changed files (v1.3.2)
 test/e2e.mjs          headless regression suite (+ test/docs fixtures)
 .github/workflows/ci.yml   GitHub Actions: npm run check + npm test on Node 20/22/24
 ```

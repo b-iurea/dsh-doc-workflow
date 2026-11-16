@@ -155,6 +155,8 @@
           'plan': 'Plan',
           'plan.written': 'plan written',
           'pending.title': 'New documents pending',
+          'disc.title': 'Discovered — not yet ingested',
+          'disc.hint': 'Tell the agent to ingest these to enter them in the flow.',
           'empty.title': 'No docflow workflow in this workspace yet',
           'empty.body': 'Start one: ask the agent for a docflow objective.',
           'empty.hint.a': 'or call the ',
@@ -269,6 +271,8 @@
           'plan': 'Piano',
           'plan.written': 'piano scritto',
           'pending.title': 'Nuovi documenti in attesa',
+          'disc.title': 'Scoperti — non ancora acquisiti',
+          'disc.hint': 'Chiedi all’agente di fare l’ingest di questi file per inserirli nel flusso.',
           'empty.title': 'Nessun workflow docflow in questo workspace',
           'empty.body': 'Avviane uno: chiedi all’agente un obiettivo docflow.',
           'empty.hint.a': 'oppure richiama il ',
@@ -335,6 +339,8 @@
         '.dfp-pill-warn{border-color:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-state-warn-primary);}',
         '.dfp-pend{border-left:2px solid var(--dsw-alias-state-warn-primary);margin:6px 0;}',
         '.dfp-pend .dfp-sec{margin:0 0 4px;color:var(--dsw-alias-state-warn-primary);}',
+        '.dfp-disc{border-left:2px solid var(--dsw-alias-brand-primary);margin:6px 0;}',
+        '.dfp-disc .dfp-sec{margin:0 0 4px;color:var(--dsw-alias-brand-primary);}',
         '.dfp-err{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary);' +
           'overflow-wrap:anywhere;margin-bottom:8px;}',
         '.dfp-entry{display:flex;align-items:center;gap:6px;padding:4px 4px;cursor:pointer;' +
@@ -1202,6 +1208,22 @@
             return React.createElement('div', { class: 'dfp-box dfp-pend' }, kids);
           }
 
+          // v1.3.2 (issue #11): files the tool discovered under doc_roots since the last ingest
+          // (computed server-side on status calls; the panel just renders what state.json holds).
+          function renderDiscovered(S) {
+            var disc = arr(S.discoveredDocs);
+            if (disc.length === 0) return null;
+            var kids = [React.createElement('div', { key: 'h', class: 'dfp-sec' }, t('disc.title'))];
+            for (var i = 0; i < disc.length; i++) {
+              var d = obj(disc[i]) || {};
+              kids.push(React.createElement('div', { key: i, class: 'dfp-v' },
+                chip(str(d.kind) === 'changed' ? 'changed' : 'new', str(d.kind) === 'changed' ? 'dfp-c-warn' : 'dfp-c-brand'),
+                React.createElement('span', { class: 'dfp-code' }, str(d.path))));
+            }
+            kids.push(React.createElement('div', { key: 'hint', class: 'dfp-meta' }, t('disc.hint')));
+            return React.createElement('div', { class: 'dfp-box dfp-disc' }, kids);
+          }
+
           function renderPlan(S) {
             var plan = obj(S.plan);
             if (!plan || !plan.writtenAt) return null;
@@ -1271,6 +1293,7 @@
               renderTasks(S),
               renderVerification(S),
               renderEntries(S),
+              renderDiscovered(S),
               renderPending(S),
               renderPlan(S)) : null);
         }
