@@ -102,6 +102,7 @@ DESIGN-v3.md          implementation contract for the interview/presets (v3) flo
 DESIGN-v3.1.md        implementation contract for emit_tasks / task drafts (v3.1)
 DESIGN-v1.3.1.md      implementation contract for reflow / step-level restart (v1.3.1)
 DESIGN-v1.3.4.md      implementation contract for v1.3.4: auto-discovery + selective re-read + panel-lifetime watcher
+DESIGN-v1.3.5.md      bugfix contract: verify-passing consumes the pending-documents round (v1.3.5)
 test/e2e.mjs          headless regression suite (+ test/docs fixtures)
 .github/workflows/ci.yml   GitHub Actions: npm run check + npm test on Node 20/22/24
 ```

@@ -1061,7 +1061,16 @@ async function runDocflow(ctx, exec, args) {
       if (problems.externals.length) report += `External sources awaiting human vouch (review the source, then attest verdict "trusted" for these ids): ${problems.externals.join(', ')}\n\n`
       await fs.writeFile(path.join(dirAbs, 'verification.md'), report, 'utf8')
       let consistency = state.consistency.status
+      let pendingCleared = 0
       if (passed) {
+        // v1.3.5 (issue #15): verification passing is what materially closes the
+        // ingest round — every pending document has been read, its entries
+        // recorded and re-anchored. Before this the list had no consumption
+        // point and ingested files sat in "New documents pending" forever.
+        if (Array.isArray(state.pendingDocs) && state.pendingDocs.length) {
+          pendingCleared = state.pendingDocs.length
+          state.pendingDocs = []
+        }
         consistency = recomputeConsistency(state)
         await renderConsistency(dirAbs, state)
         if (consistency === 'passed' || consistency === 'n/a') {
@@ -1089,6 +1098,7 @@ async function runDocflow(ctx, exec, args) {
           ? { hint: 'External sources block VERIFIED until a human vouches for them: ask the user to review each listed source, then attest verdict "trusted" for those ids, then verify again.' }
           : {}),
         report: path.join(dirAbs, 'verification.md'),
+        ...(pendingCleared ? { pending_cleared: `${pendingCleared} pending document(s) acknowledged — integrity passed on the re-verified index` } : {}),
         next: guidanceFor(state),
       }
     }
