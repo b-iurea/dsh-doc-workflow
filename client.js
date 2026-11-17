@@ -37,20 +37,20 @@
  * dependencies — plain ES5 inside the factory, loaded via
  * window.__ModuleLoader__.
  *
- * @module @local/doc-workflow
+ * @module dsh-doc-workflow
  */
 (function () {
   'use strict';
   var mod = window.__ModuleLoader__;
   if (!mod || typeof mod.load !== 'function') return;
   mod.load({
-    id: '@local/doc-workflow',
+    id: 'dsh-doc-workflow',
     factory: function (require) {
       var React = require('react');
       var exports = {};
 
       var NS = 'docflowPanel';
-      var TAB_ID = '@local/doc-workflow';
+      var TAB_ID = 'dsh-doc-workflow';
       var TAB_KIND = 'docflow';
 
       var CHUNK_BYTES = 1 << 20;    // 1 MiB byte-window per readBytes call
