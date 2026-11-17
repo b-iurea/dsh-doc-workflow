@@ -168,6 +168,9 @@
           'reflow.sending': 'sending…',
           'reflow.sent': 'request sent ✓',
           'reflow.failed': 'request failed',
+          'reflow.pick': 'Re-read only these files',
+          'reflow.pickAll': 'nothing checked — full re-read',
+          'reflow.pickN': '{n} selected — only these will be re-read, the others keep their verification',
           'reflow.copyHint': 'Copy this line and paste it in the chat.',
           'reflow.copy': 'copy',
           'reflow.copied': 'copied ✓',
@@ -284,6 +287,9 @@
           'reflow.sending': 'invio…',
           'reflow.sent': 'richiesta inviata ✓',
           'reflow.failed': 'invio non riuscito',
+          'reflow.pick': 'Rileggi solo questi file',
+          'reflow.pickAll': 'nessuna spunta — rilettura completa',
+          'reflow.pickN': '{n} selezionati — verranno riletti solo questi, gli altri restano verificati',
           'reflow.copyHint': 'Copia questa riga e incollala in chat.',
           'reflow.copy': 'copia',
           'reflow.copied': 'copiato ✓',
@@ -341,6 +347,9 @@
         '.dfp-pend .dfp-sec{margin:0 0 4px;color:var(--dsw-alias-state-warn-primary);}',
         '.dfp-disc{border-left:2px solid var(--dsw-alias-brand-primary);margin:6px 0;}',
         '.dfp-disc .dfp-sec{margin:0 0 4px;color:var(--dsw-alias-brand-primary);}',
+        '.dfp-pick{display:flex;align-items:center;gap:6px;font-size:12px;padding:1px 0;cursor:pointer;}',
+        '.dfp-pick input{accent-color:var(--dsw-alias-brand-primary);}',
+        '.dfp-pick code{font-size:11px;}',
         '.dfp-err{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary);' +
           'overflow-wrap:anywhere;margin-bottom:8px;}',
         '.dfp-entry{display:flex;align-items:center;gap:6px;padding:4px 4px;cursor:pointer;' +
@@ -432,9 +441,10 @@
       }
       function stepTitle(id) { return id.charAt(0).toUpperCase() + id.slice(1); }
       /** §4 TEMPLATE — fixed English, machine-readable for the agent (never localized). */
-      function reflowPromptText(step) {
+      function reflowPromptText(step, paths) {
         return '[docflow-panel] Reflow requested from step "' + stepTitle(step) +
           '". Call docflow action=reflow to_stage=' + step +
+          (Array.isArray(paths) && paths.length ? ' paths=' + JSON.stringify(paths) : '') +
           ', tell the user what was kept vs invalidated from the result, and continue from its next guidance.';
       }
       var CAN_CLIPBOARD = typeof navigator !== 'undefined' && !!(navigator.clipboard && navigator.clipboard.writeText);
@@ -550,6 +560,8 @@
           var reflow = _reflow[0], setReflow = _reflow[1];
           var _copied = React.useState(false);
           var copied = _copied[0], setCopied = _copied[1];
+          var _pick = React.useState({});       // v1.3.3: reflow(reading) — files checked for a selective re-read
+          var pick = _pick[0], setPick = _pick[1];
           var stageRef = React.useRef('');      // live stage, for async-send guards
           var _tick = React.useState(0);
           var tickv = _tick[0], setTickv = _tick[1];
@@ -601,6 +613,19 @@
             }
             var ctrl = new AbortController();
             ctrlRef.current = ctrl;
+            // v1.3.4 (issue #14): while this panel is mounted it renews a host-side
+            // lease on the state file — the host then watches doc_roots and keeps
+            // `discovered` fresh between agent turns. Fire-and-forget; the lease
+            // lapses on its own once this panel stops beating.
+            try {
+              if (typeof fetch === 'function') {
+                fetch('/api/docflow/lease', {
+                  method: 'POST', headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ sessionId: sessionId, file: file }),
+                  signal: ctrl.signal,
+                }).catch(function () {});
+              }
+            } catch (e) { /* non-http host (CLI): the watcher feature simply stays dormant */ }
             statFile(remote, sessionId, file, ctrl.signal).then(function (st) {
               if (ctrl.signal.aborted) return;
               if (!st) {
@@ -639,7 +664,7 @@
           React.useEffect(function () {
             if (!reflow) return;
             var st = ui.phase === 'ready' ? str((obj(ui.data) || {}).stage) : '';
-            if (st && st !== reflow.atStage) { setReflow(null); setOpenStep(null); }
+            if (st && st !== reflow.atStage) { setReflow(null); setOpenStep(null); setPick({}); }
           }, [ui.data, ui.phase, reflow]);
 
           function doRefresh() {
@@ -655,7 +680,18 @@
           }
           function toggleStep(step) {
             setCopied(false);
+            setPick({}); // v1.3.3: the checklist resets when the box closes or switches step
             setOpenStep(openStep === step ? null : step);
+          }
+          function togglePick(f) {
+            var p = Object.assign({}, pick);
+            if (p[f]) delete p[f]; else p[f] = true;
+            setPick(p);
+          }
+          /** v1.3.3: checked files for the reading reflow box ([] = full re-read). */
+          function pickFor(step) {
+            if (step !== 'reading') return [];
+            return Object.keys(pick).filter(function (k) { return pick[k]; }).sort();
           }
           function doCopy(text) {
             try {
@@ -674,7 +710,7 @@
             try {
               p = Promise.resolve(api.prompt({
                 requestId: rid, sessionId: sessionId, mode: 'queue',
-                content: [{ type: 'text', text: reflowPromptText(step) }],
+                content: [{ type: 'text', text: reflowPromptText(step, pickFor(step)) }],
               }));
             } catch (err) {
               setReflow({ step: step, status: 'error', atStage: atStage, message: str((err && err.message) || err) });
@@ -891,6 +927,26 @@
             var info = reflowInfo(S, step);
             for (var i = 0; i < info.length; i++) kids.push(React.createElement(React.Fragment, { key: 'i' + i }, info[i]));
             if (!info.length) kids.push(React.createElement('div', { key: 'n', class: 'dfp-none' }, t('reflow.noinfo')));
+            // v1.3.3 (issue #12): reading step offers a file checklist — checked files
+            // become the selective re-read scope (paths=[…] appended to the prompt).
+            if (step === 'reading') {
+              var snap = obj(S.docSnapshot);
+              var snapFiles = snap && obj(snap.files) ? Object.keys(snap.files).sort() : [];
+              if (snapFiles.length) {
+                var nPick = pickFor('reading').length;
+                kids.push(React.createElement('div', { key: 'pkh', class: 'dfp-k' }, t('reflow.pick')));
+                var shown = snapFiles.slice(0, 30);
+                for (var fi = 0; fi < shown.length; fi++) {
+                  kids.push(React.createElement('label', { key: 'pk' + fi, class: 'dfp-pick' },
+                    React.createElement('input', { type: 'checkbox', checked: !!pick[shown[fi]], onChange: togglePick.bind(null, shown[fi]) }),
+                    React.createElement('code', null, shown[fi])));
+                }
+                if (snapFiles.length > shown.length)
+                  kids.push(React.createElement('div', { key: 'pkm', class: 'dfp-none' }, '… +' + (snapFiles.length - shown.length)));
+                kids.push(React.createElement('div', { key: 'pkn', class: 'dfp-none' },
+                  nPick ? t('reflow.pickN').replace('{n}', String(nPick)) : t('reflow.pickAll')));
+              }
+            }
             if (api && sessionId) {
               var sending = !!(r && r.status === 'sending');
               var sent = !!(r && r.status === 'sent');
@@ -904,7 +960,7 @@
                   key: 'e', class: 'dfp-warnbadge', title: r.message || undefined,
                 }, t('reflow.failed')) : null));
               if (r && r.status === 'error') {
-                var ptxt = reflowPromptText(step);
+                var ptxt = reflowPromptText(step, pickFor(step));
                 kids.push(React.createElement('div', { key: 'fb', class: 'dfp-row' }, React.createElement('input', {
                   class: 'dfp-input', type: 'text', readOnly: true, value: ptxt,
                   onFocus: function (ev) { if (ev.target.select) { try { ev.target.select(); } catch (e) { /* ignore */ } } },

@@ -2,7 +2,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import assert from 'node:assert'
-import { apply } from '../index.js'
+import { apply, leaseApi } from '../index.js'
 
 const ROOT = process.cwd()
 const WS = path.join(ROOT, 'ws')
@@ -505,7 +505,7 @@ r = await call({ action: 'ingest', paths: ['docs/new.md'] })
   record('R1', tool.parameters.properties.action.enum.includes('reflow') &&
     tool.parameters.properties.action.enum.indexOf('reflow') === tool.parameters.properties.action.enum.indexOf('emit_tasks') + 1 &&
     JSON.stringify(tool.parameters.properties.to_stage.enum) === '["reading","indexing","consistency","gaps","interview","presets","plan","tasks"]' &&
-    /-> reflow\(to_stage\): re-run any step at or upstream of the current stage/.test(tool.description),
+    /-> reflow\(to_stage(?:, paths\?)?\): re-run any step at or upstream of the current stage/.test(tool.description),
   'tool surface §3: action enum += reflow after emit_tasks, to_stage enum of 8, description mentions reflow')
 
   // §6 starting fixture: full flow to done — U1..U4 + full verdicts + presets emitted + tasks emitted
@@ -802,6 +802,96 @@ r = await call({ action: 'ingest', paths: ['docs/new.md'] })
   r = await callOn(t2, { action: 'status' })
   record('D8', JSON.stringify(r.discovered.map((d) => d.path)) === '["docs/y.md"]', 'after the baseline, new files are discovered')
   d2.forEach((x) => x())
+}
+
+// 20. v1.3.3 selective re-read on reflow(reading) — issue #12 (checks S1..S9)
+{
+  const dirp = path.join(ROOT, 'ws-scope')
+  await fs.rm(dirp, { recursive: true, force: true })
+  await fs.mkdir(path.join(dirp, 'docs'), { recursive: true })
+  await fs.mkdir(path.join(dirp, '.doc-workflow'), { recursive: true })
+  await fs.writeFile(path.join(dirp, 'docs/a.md'), 'alpha\n', 'utf8')
+  await fs.writeFile(path.join(dirp, 'docs/b.md'), 'beta\n', 'utf8')
+  await fs.writeFile(path.join(dirp, 'docs/c.md'), 'gamma\n', 'utf8')
+  const stateFile = path.join(dirp, '.doc-workflow/state.json')
+  const putState = async (s) => fs.writeFile(stateFile, JSON.stringify(s), 'utf8')
+  const readSt = async () => JSON.parse(await fs.readFile(stateFile, 'utf8'))
+  await putState(v3State())
+  const { tool: ts, disposers: ds } = stubTool(dirp)
+  r = await callOn(ts, { action: 'reflow', to_stage: 'reading', paths: ['docs/b.md'] })
+  record('S1', r.ok && (r.kept || []).some((s) => /selective re-read scope set: 1/.test(s)), 'reflow(reading) with paths sets the scope')
+  r = await callOn(ts, { action: 'status' })
+  record('S2', r.ok && r.reading_scope && JSON.stringify(r.reading_scope.paths) === '["docs/b.md"]', 'status exposes reading_scope')
+  record('S3', (r.next || []).some((s) => /SELECTIVE RE-READ/.test(s) && s.includes('docs/b.md')), 'reading guidance restricts the re-read to the picked files')
+  r = await callOn(ts, { action: 'reflow', to_stage: 'reading', paths: ['docs/zz.md'] })
+  record('S4', !r.ok && String(r.error).includes('docs/zz.md'), 'missing file fails the reflow listing the path')
+  record('S5', JSON.stringify((await readSt()).readingScope.paths) === '["docs/b.md"]', 'failed reflow did not touch the previous scope (no partial write)')
+  r = await callOn(ts, { action: 'reflow', to_stage: 'reading' })
+  record('S6', r.ok && (r.invalidated || []).some((s) => /selective re-read scope cleared/.test(s)) && (await readSt()).readingScope === undefined, 'reflow(reading) without paths restores the full reading')
+  await callOn(ts, { action: 'reflow', to_stage: 'reading', paths: ['docs/a.md', 'docs/c.md'] })
+  r = await callOn(ts, { action: 'ingest', paths: ['docs/c.md'] })
+  record('S7', r.ok && (await readSt()).readingScope === undefined, 'ingest clears the scope — new documents must not be suppressed by a stale pick')
+  await putState(v3State({ stage: 'plan' }))
+  r = await callOn(ts, { action: 'reflow', to_stage: 'consistency', paths: ['docs/a.md'] })
+  record('S8', !r.ok && /only accepted with to_stage=reading/.test(String(r.error)), 'paths on a non-reading reflow is rejected')
+  await putState(v3State({ stage: 'tasks' }))
+  await callOn(ts, { action: 'reflow', to_stage: 'reading', paths: ['docs/b.md'] })
+  r = await callOn(ts, { action: 'add_entries', entries: [{ useful: true, title: 't2', content: 'c2', source_kind: 'doc', source_file: 'docs/a.md', source_quote: 'alpha' }] })
+  record('S9', r.ok && r.stage === 'indexing' && (await readSt()).readingScope === undefined, 'advancing past reading (add_entries) clears the scope')
+  ds.forEach((x) => x())
+}
+
+// 21. v1.3.4 panel-lifetime watcher — issue #14 (checks W1..W6)
+{
+  const dirp = path.join(ROOT, 'ws-lease')
+  await fs.rm(dirp, { recursive: true, force: true })
+  await fs.mkdir(path.join(dirp, 'docs'), { recursive: true })
+  await fs.mkdir(path.join(dirp, '.doc-workflow'), { recursive: true })
+  await fs.writeFile(path.join(dirp, 'docs/a.md'), 'alpha\n', 'utf8')
+  const stateFile = path.join(dirp, '.doc-workflow/state.json')
+  const readSt = async () => JSON.parse(await fs.readFile(stateFile, 'utf8'))
+  const hasDisc = async (p) => ((await readSt()).discoveredDocs || []).some((d) => d.path === p)
+  const waitUntil = async (fn, ms = 5000) => {
+    const t0 = Date.now()
+    while (Date.now() - t0 < ms) {
+      if (await fn()) return true
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    return false
+  }
+  await fs.writeFile(stateFile, JSON.stringify(v3State({ doc_roots: ['docs'] })), 'utf8')
+  const { tool: tl, disposers: dl } = stubTool(dirp)
+  await callOn(tl, { action: 'status' }) // baselines docSnapshot silently (legacy state)
+  // W1: first heartbeat reconciles what changed while no panel was mounted
+  await fs.writeFile(path.join(dirp, 'docs/late.md'), 'late\n', 'utf8')
+  const ok1 = await leaseApi.heartbeat(stateFile)
+  record('W1', ok1 === true && (await hasDisc('docs/late.md')) && leaseApi.count() === 1,
+    'first heartbeat reconciles changes made while the panel was closed; lease counted')
+  // W2: while leased, a filesystem event rewrites state.json with NO tool call in between
+  await fs.writeFile(path.join(dirp, 'docs/late2.md'), 'late2\n', 'utf8')
+  const got2 = await waitUntil(() => hasDisc('docs/late2.md'))
+  record('W2', got2, 'fs event under doc_roots triggers debounced reconcile (no tool invocation)')
+  // W3: releasing the lease stops the watching
+  leaseApi.release(stateFile)
+  record('W3a', leaseApi.count() === 0, 'release drops the lease and its watchers')
+  await fs.writeFile(path.join(dirp, 'docs/late3.md'), 'late3\n', 'utf8')
+  const quiet = !(await waitUntil(() => hasDisc('docs/late3.md'), 1500))
+  record('W3b', quiet, 'no rewrite after release — watchers really closed')
+  // W4: a new heartbeat re-arms and catches up
+  await leaseApi.heartbeat(stateFile)
+  record('W4', (await hasDisc('docs/late3.md')) && leaseApi.count() === 1, 're-lease reconciles everything missed while released')
+  // W5: heartbeat on a non-docflow state file is refused, no lease left behind
+  leaseApi.releaseAll()
+  const junk = path.join(dirp, 'junk', 'state.json')
+  await fs.mkdir(path.join(dirp, 'junk'), { recursive: true })
+  await fs.writeFile(junk, JSON.stringify({ kind: 'other' }), 'utf8')
+  const ok5 = await leaseApi.heartbeat(junk)
+  record('W5', ok5 === false && leaseApi.count() === 0, 'non-docflow state.json refuses the lease cleanly')
+  // W6: reconcile on a lease-free path is a silent no-op (status stays the headless truth)
+  const ok6 = await leaseApi.reconcile(junk)
+  record('W6', ok6 === false, 'leaseReconcile refuses non-docflow state')
+  leaseApi.releaseAll()
+  dl.forEach((x) => x())
 }
 
 console.log(results.join('\n'))
