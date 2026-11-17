@@ -20,6 +20,7 @@
  */
 
 import fs from 'node:fs/promises'
+import { watch as fsWatch } from 'node:fs'
 import path from 'node:path'
 
 export const inject = ['tools', 'sessions', 'workingDirectory', 'systemPrompt']
@@ -209,6 +210,10 @@ function migrateState(state) {
       dirty = true
     }
   }
+  if (!Array.isArray(state.discoveredDocs)) {
+    state.discoveredDocs = []
+    dirty = true
+  }
   if (state.version !== STATE_VERSION) {
     if (state.version < 2) {
       // v1 trusted "line anchor, no quote" and had no consistency phase: force re-check
@@ -348,6 +353,11 @@ async function renderIndex(dirAbs, state) {
     for (const p of state.pendingDocs) out.push(`- \`${p}\``)
     out.push('')
   }
+  if (state.discoveredDocs && state.discoveredDocs.length) {
+    out.push('## Discovered — new/changed files not yet ingested', '')
+    for (const d of state.discoveredDocs) out.push(`- \`${d.path}\` (${d.kind}, seen ${d.seenAt})`)
+    out.push('')
+  }
   await fs.writeFile(path.join(dirAbs, 'index.md'), out.join('\n'), 'utf8')
 }
 
@@ -362,6 +372,8 @@ function guidanceFor(state) {
   switch (state.stage) {
     case 'reading':
       g.push('Read the documents under doc_roots with your own tools (read/grep/glob).')
+      if (state.readingScope && Array.isArray(state.readingScope.paths) && state.readingScope.paths.length)
+        g.push(`SELECTIVE RE-READ (v1.3.3): the user scoped this re-read to ${state.readingScope.paths.length} file(s) — ${state.readingScope.paths.map((p) => '`' + p + '`').join(', ')} — re-read ONLY these; the other files keep their verification state and need no re-read. A later reflow to_stage=reading without paths (or an ingest) restores the full reading.`)
       if (state.gates.understanding.status === 'open')
         g.push('FORM UNDERSTANDING QUESTIONS: wherever the objective is ambiguous or a passage is unclear/unreliable w.r.t. the objective, ask the user with ask_user_question, then log them with action=gate_ask phase=understanding, and record the user answers with action=gate_answer phase=understanding. The understanding gate must be answered before entries can be recorded.')
       if (state.gates.understanding.reconfirm)
@@ -412,6 +424,10 @@ function guidanceFor(state) {
     default:
       g.push('Call action=start with the objective and doc_roots.')
   }
+  if (state.discoveredDocs && state.discoveredDocs.length) {
+    const list = state.discoveredDocs.map((d) => `\`${d.path}\` (${d.kind})`).join(', ')
+    g.push(`AUTO-DISCOVERY: ${state.discoveredDocs.length} file(s) under doc_roots are new or changed since the last ingest — ${list}. Surface this to the user and, once they acknowledge, call action=ingest with these paths to enter them in the flow. Do not ingest without the user's acknowledgement.`)
+  }
   return g
 }
 
@@ -461,6 +477,20 @@ function statusPayload(state, dirAbs) {
       return { status: state.consistency.status, pairs: cl.pairs.length, missing: cl.missing, conflicts: cl.conflicts }
     })(),
     pending_docs: state.pendingDocs || [],
+    // v1.3.2 (issue #11): files discovered by the last scan, awaiting ingest.
+    discovered: (state.discoveredDocs || []).map((d) => ({ path: d.path, kind: d.kind, seen_at: d.seenAt })),
+    ...(state.docSnapshot
+      ? {
+          doc_snapshot: {
+            taken_at: state.docSnapshot.takenAt,
+            files: Object.keys(state.docSnapshot.files || {}).length,
+            ...(state.docSnapshot.truncated ? { truncated: true } : {}),
+          },
+        }
+      : {}),
+    ...(state.readingScope
+      ? { reading_scope: { paths: state.readingScope.paths, set_at: state.readingScope.setAt } }
+      : {}),
     next: guidanceFor(state),
   }
   if (state.plan && state.plan.writtenAt) payload.plan = { notes: path.join(dirAbs, 'NOTES.md'), plan: path.join(dirAbs, 'PLAN.md') }
@@ -486,10 +516,109 @@ function freshState(objective, docRoots, dirName) {
     consistency: { status: 'n/a', verdicts: {}, updatedAt: undefined },
     entries: {},
     pendingDocs: [],
+    // v1.3.2 (issue #11): mtime/size manifest of doc_roots taken at start/ingest, plus the
+    // auto-discovered new/changed files still waiting for an ingest acknowledgement.
+    docSnapshot: null,
+    discoveredDocs: [],
     plan: {},
     createdAt: now(),
     updatedAt: now(),
   }
+}
+
+// ---------------------------------------------------------------------------
+// v1.3.2 (issue #11): auto-discovery of new/changed files under doc_roots
+// ---------------------------------------------------------------------------
+
+const SCAN_FILE_CAP = 2000
+
+function relPath(cwd, abs) {
+  return path.relative(cwd, abs).split(path.sep).join('/')
+}
+
+/** mtime/size manifest of one root (file root = itself; dir root = bounded recursive walk). */
+async function scanRootFiles(abs, cwd, files, counter) {
+  let st
+  try {
+    st = await fs.stat(abs)
+  } catch {
+    return
+  }
+  if (st.isFile()) {
+    files[relPath(cwd, abs)] = { m: Math.floor(st.mtimeMs), s: st.size }
+    return
+  }
+  if (!st.isDirectory()) return
+  const stack = [abs]
+  while (stack.length) {
+    const dir = stack.pop()
+    let ents
+    try {
+      ents = await fs.readdir(dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const ent of ents) {
+      if (counter.n >= SCAN_FILE_CAP) {
+        counter.truncated = true
+        return
+      }
+      const child = path.join(dir, ent.name)
+      if (ent.isDirectory()) {
+        if (ent.name.startsWith('.') || ent.name === 'node_modules') continue
+        stack.push(child)
+      } else if (ent.isFile()) {
+        let fst
+        try {
+          fst = await fs.stat(child)
+        } catch {
+          continue
+        }
+        files[relPath(cwd, child)] = { m: Math.floor(fst.mtimeMs), s: fst.size }
+        counter.n++
+      }
+    }
+  }
+}
+
+async function snapshotDocRoots(cwd, docRoots) {
+  const files = {}
+  const counter = { n: 0, truncated: false }
+  for (const root of docRoots || []) await scanRootFiles(path.resolve(cwd, root), cwd, files, counter)
+  return { files, truncated: counter.truncated }
+}
+
+/** Diff the live scan against the stored snapshot; keep seenAt stable for repeated discoveries. */
+function applyDiscovery(state, scan) {
+  const prev = (state.docSnapshot && state.docSnapshot.files) || {}
+  const found = []
+  for (const [p, v] of Object.entries(scan.files)) {
+    const old = prev[p]
+    if (!old) found.push({ path: p, kind: 'new' })
+    else if (old.m !== v.m || old.s !== v.s) found.push({ path: p, kind: 'changed' })
+  }
+  found.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  const was = {}
+  for (const d of state.discoveredDocs || []) was[d.path] = d
+  state.discoveredDocs = found.map((f) => ({ path: f.path, kind: f.kind, seenAt: (was[f.path] || {}).seenAt || now() }))
+}
+
+/**
+ * Re-scan doc_roots and refresh state.discoveredDocs. The first call on a pre-v1.3.2
+ * workflow only takes the baseline (already-read docs must not flood the notice).
+ * Returns true when state changed enough to be worth persisting.
+ */
+async function discoverDocs(cwd, state) {
+  if (!state.docSnapshot) {
+    const scan = await snapshotDocRoots(cwd, state.doc_roots)
+    state.docSnapshot = { takenAt: now(), files: scan.files, truncated: scan.truncated }
+    state.discoveredDocs = []
+    return true
+  }
+  const before = (state.discoveredDocs || []).map((d) => `${d.path}:${d.kind}`).join('|')
+  const scan = await snapshotDocRoots(cwd, state.doc_roots)
+  applyDiscovery(state, scan)
+  return before !== state.discoveredDocs.map((d) => `${d.path}:${d.kind}`).join('|')
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +853,9 @@ async function runDocflow(ctx, exec, args) {
         'utf8',
       )
       for (const gd of Object.values(GATE_DOCS)) await fs.writeFile(path.join(startAbs, gd.file), gd.header, 'utf8')
+      // v1.3.2 (issue #11): baseline manifest — everything under doc_roots at start is "already known".
+      const baseScan = await snapshotDocRoots(cwd, st.doc_roots)
+      st.docSnapshot = { takenAt: now(), files: baseScan.files, truncated: baseScan.truncated }
       await writeJson(path.join(startAbs, 'state.json'), st)
       await renderIndex(startAbs, st)
       return { ok: true, stage: st.stage, folder: startAbs, next: guidanceFor(st) }
@@ -736,6 +868,12 @@ async function runDocflow(ctx, exec, args) {
           stage: 'no-workflow',
           next: 'Call action=start with objective (as defined by the user) and doc_roots (documents/directories to read). If the objective is not clear from the conversation, ask the user first.',
         }
+      // v1.3.2 (issue #11): on-demand auto-discovery — every status call diffs doc_roots
+      // against the last snapshot and keeps notifying until the files are ingested.
+      if (await discoverDocs(cwd, state)) {
+        await writeJson(path.join(dirAbs, 'state.json'), state)
+        await renderIndex(dirAbs, state)
+      }
       return statusPayload(state, dirAbs)
 
     case 'reset': {
@@ -847,6 +985,7 @@ async function runDocflow(ctx, exec, args) {
         added.push(id)
       }
       state.stage = 'indexing'
+      delete state.readingScope // v1.3.3: leaving reading ends any selective re-read scope
       if (state.verification.status === 'passed') state.verification.status = 'stale'
       presetsStale(state)
       await writeJson(path.join(dirAbs, 'state.json'), state)
@@ -1176,6 +1315,8 @@ async function runDocflow(ctx, exec, args) {
       // gate history files — invalidation is expressed only through the staleness machinery.
       if (typeof args.to_stage !== 'string' || REFLOW_ORDER.indexOf(args.to_stage) === -1)
         return fail(`reflow requires to_stage: one of ${REFLOW_ORDER.join(', ')}.`, 'reflow re-runs the named step — the current stage or an earlier one.')
+      if (args.paths !== undefined && args.to_stage !== 'reading')
+        return fail('reflow paths are only accepted with to_stage=reading — the selective re-read scope exists only for the reading step.', 'Drop paths, or reflow to_stage=reading with paths=[the files to re-read].')
       const target = REFLOW_ORDER.indexOf(args.to_stage)
       const pos = stagePos(state.stage)
       if (target > pos)
@@ -1192,10 +1333,31 @@ async function runDocflow(ctx, exec, args) {
         if (!tasksWasStale && state.tasks?.stale) invalidated.push('task drafts marked stale (re-emit after upstream re-run)')
       }
       switch (args.to_stage) {
-        case 'reading':
+        case 'reading': {
           state.stage = 'reading'
           kept.push('verification, consistency, presets, plan and tasks all kept — a re-read alone invalidates nothing; entry edits then trigger the normal staleness machinery')
+          // v1.3.3 (issue #12): optional user-picked scope — re-read only these files;
+          // everything else keeps its verification state untouched.
+          if (Array.isArray(args.paths) && args.paths.length) {
+            const picked = []
+            const missing = []
+            for (const p of args.paths) {
+              if (typeof p !== 'string' || !p.trim()) return fail('reflow paths must be non-empty file paths.', 'Pass workspace-relative paths of existing files (the panel checklist offers exactly those), or omit paths for a full re-read.')
+              try {
+                const fst = await fs.stat(path.resolve(cwd, p))
+                if (!fst.isFile()) missing.push(p)
+                else picked.push(String(p).split(path.sep).join('/'))
+              } catch { missing.push(p) }
+            }
+            if (missing.length) return fail(`reflow paths: not readable files: ${missing.join(', ')}.`)
+            state.readingScope = { paths: [...new Set(picked)].sort(), setAt: now() }
+            kept.push(`selective re-read scope set: ${state.readingScope.paths.length} file(s) — files outside the list keep their verification state`)
+          } else {
+            if (state.readingScope) invalidated.push('previous selective re-read scope cleared — reading is full again')
+            delete state.readingScope
+          }
           break
+        }
         case 'indexing':
           state.verification = { status: 'unverified', lastRun: undefined, failed: [], unanchored: [], unattested: [], suspect: [], externals: [] }
           state.consistency.verdicts = {}
@@ -1266,6 +1428,10 @@ async function runDocflow(ctx, exec, args) {
           invalidated.push('task drafts block removed — re-run emit_tasks to regenerate TASKS.md')
           break
       }
+      if (args.to_stage !== 'reading' && state.readingScope) {
+        delete state.readingScope
+        invalidated.push('selective re-read scope cleared (the scope only exists for the reading step)')
+      }
       state.updatedAt = now()
       await writeJson(path.join(dirAbs, 'state.json'), state)
       await renderIndex(dirAbs, state)
@@ -1274,7 +1440,26 @@ async function runDocflow(ctx, exec, args) {
     case 'ingest': {
       if (!Array.isArray(args.paths) || args.paths.length === 0) return fail('ingest requires paths: new or changed documents.')
       state.pendingDocs = [...new Set([...(state.pendingDocs || []), ...args.paths])]
+      // v1.3.2 (issue #11): the ingest acknowledges the listed files — they become part of
+      // the snapshot and leave the discovered list; other discoveries keep notifying.
+      if (state.docSnapshot) {
+        const norm = (p) => String(p).split(path.sep).join('/')
+        const ingested = args.paths.map(norm)
+        const under = (p) => ingested.some((ip) => p === ip || p.startsWith(ip + '/'))
+        const scan = await snapshotDocRoots(cwd, state.doc_roots)
+        for (const [p, v] of Object.entries(scan.files)) if (under(p)) state.docSnapshot.files[p] = v
+        for (const p of ingested) {
+          const abs = path.resolve(cwd, p)
+          try {
+            const fst = await fs.stat(abs)
+            if (fst.isFile()) state.docSnapshot.files[norm(p)] = { m: Math.floor(fst.mtimeMs), s: fst.size }
+          } catch {}
+        }
+        state.docSnapshot.takenAt = now()
+        state.discoveredDocs = (state.discoveredDocs || []).filter((d) => !under(d.path))
+      }
       state.stage = 'reading'
+      if (state.readingScope) delete state.readingScope // v1.3.3: new documents widen the reading — a stale pick must not suppress them
       state.verification.status = 'unverified'
       state.gates.understanding.reconfirm = state.gates.understanding.status === 'answered'
       state.gates.interview.reconfirm = state.gates.interview.status === 'answered'
@@ -1316,8 +1501,8 @@ function makeTool(ctx) {
     name: 'docflow',
   description:
     'Document-driven workflow engine for project work: turn project documents into a source-verified index and a plan. ' +
-    'Stage machine: start(objective, doc_roots) -> read docs -> understanding gate (ask the user via ask_user_question, then gate_ask/gate_answer phase=understanding) -> add_entries (useful/not-useful filtered info; every entry MUST carry a verbatim source_quote plus source_kind "doc" (project source_file) or "external" (source_ref URL/path) — assumed content is rejected) -> attest(ok|suspect; trusted for external sources after human review) trustworthiness -> verify = INTEGRITY check (source readable + quote found verbatim; unvouched external sources keep it from passing; failures send you back to re-read and fix) -> CONSISTENCY phase: crosscheck records one verdict per pair of useful entries (consistent|conflict); conflicts block the workflow until the entries are corrected and re-reviewed -> gaps gate (ask the user what information is missing to reach the objective, phase=gaps) -> interview gate (phase=interview: propose the agent roles + delivery type code/docs/answer-only, the user confirms via gate_answer with the interview payload) -> emit_presets writes source-backed agent role cards under agents/ + PRESETS.md (answer-only skips presets explicitly) -> write_plan(notes_md, plan_md) -> emit_tasks (TEAM BRIDGE, only when presets were emitted): team task drafts rendered to TASKS.md, each 1:1 mappable to team_task_create (subject/description/role/plan_phase/write_scopes/blocked_by), or an explicit skip via tasks=[] + skip_reason -> reflow(to_stage): re-run any step at or upstream of the current stage, invalidating downstream artifacts (entries and gates history are never silently dropped). ' +
-    'New documents arrive via ingest and re-enter the loop. status returns the current stage, gate/verification/consistency state and the exact next steps — follow its "next" guidance. The workflow state lives in a .doc-workflow/ folder in the session workspace (objective.md, index.md, questions-*.md, verification.md, consistency.md, agents/<role>.md, PRESETS.md, NOTES.md, PLAN.md, TASKS.md). Use this tool whenever asked to analyze project documents toward an objective, build/update index.md, verify source reliability or logical coherence, or write notes/plan from documentation.',
+    'Stage machine: start(objective, doc_roots) -> read docs -> understanding gate (ask the user via ask_user_question, then gate_ask/gate_answer phase=understanding) -> add_entries (useful/not-useful filtered info; every entry MUST carry a verbatim source_quote plus source_kind "doc" (project source_file) or "external" (source_ref URL/path) — assumed content is rejected) -> attest(ok|suspect; trusted for external sources after human review) trustworthiness -> verify = INTEGRITY check (source readable + quote found verbatim; unvouched external sources keep it from passing; failures send you back to re-read and fix) -> CONSISTENCY phase: crosscheck records one verdict per pair of useful entries (consistent|conflict); conflicts block the workflow until the entries are corrected and re-reviewed -> gaps gate (ask the user what information is missing to reach the objective, phase=gaps) -> interview gate (phase=interview: propose the agent roles + delivery type code/docs/answer-only, the user confirms via gate_answer with the interview payload) -> emit_presets writes source-backed agent role cards under agents/ + PRESETS.md (answer-only skips presets explicitly) -> write_plan(notes_md, plan_md) -> emit_tasks (TEAM BRIDGE, only when presets were emitted): team task drafts rendered to TASKS.md, each 1:1 mappable to team_task_create (subject/description/role/plan_phase/write_scopes/blocked_by), or an explicit skip via tasks=[] + skip_reason -> reflow(to_stage, paths?): re-run any step at or upstream of the current stage, invalidating downstream artifacts (entries and gates history are never silently dropped); with to_stage=reading an optional paths list narrows the re-read to the user-picked files (selective re-read scope, reported as reading_scope in status). ' +
+    'New documents arrive via ingest and re-enter the loop. status auto-discovers files under doc_roots that are new or changed since the last ingest (diffs an mtime/size manifest, on demand — no background polling) and keeps surfacing them in "discovered" + next guidance until you acknowledge with ingest; pre-ingest discovery never enters the flow by itself. status returns the current stage, gate/verification/consistency state and the exact next steps — follow its "next" guidance. The workflow state lives in a .doc-workflow/ folder in the session workspace (objective.md, index.md, questions-*.md, verification.md, consistency.md, agents/<role>.md, PRESETS.md, NOTES.md, PLAN.md, TASKS.md). Use this tool whenever asked to analyze project documents toward an objective, build/update index.md, verify source reliability or logical coherence, or write notes/plan from documentation.',
   parameters: {
     type: 'object',
     properties: {
@@ -1408,7 +1593,7 @@ function makeTool(ctx) {
         },
         description: 'crosscheck: logical-consistency verdict per pair of useful entries; full coverage is required.',
       },
-      paths: { type: 'array', items: { type: 'string' }, description: 'ingest: new/changed documents.' },
+      paths: { type: 'array', items: { type: 'string' }, description: 'ingest: new/changed documents. reflow (only with to_stage=reading): the files the user picked to re-read — the others keep their verification state; omit or empty restores the full reading.' },
       verdict: { type: 'string', enum: ['ok', 'suspect', 'trusted'], description: 'attest: your trustworthiness judgment. trusted = explicit human vouch required to clear an external (URL/path) source.' },
       ids: { type: 'array', items: { type: 'string' }, description: 'attest: entry ids or ["ALL"].' },
       note: { type: 'string' },
@@ -1449,13 +1634,256 @@ const PROMPT_SECTION = {
     'Whenever docflow returns "next" guidance, follow it literally.',
 }
 
+// ---------------------------------------------------------------------------
+// v1.3.4 (issue #14): panel-lifetime watcher
+// ---------------------------------------------------------------------------
+// While a Docflow panel is mounted it renews a lease on its state file about
+// every 7 s (the panel's existing poll tick). The first heartbeat of a lease
+// runs ONE reconcile diff through discoverDocs — the same diff `status` runs,
+// so changes that landed while the panel was closed surface at once — then
+// fs.watch on each doc_root debounces 500 ms onto that same diff whenever a
+// write lands. No checksums: events only replace "ask for status" as the
+// trigger; the mtime+size manifest stays the source of truth. A lease whose
+// last heartbeat is older than ~20 s (panel closed, navigated away, host dead)
+// releases its watchers, so nothing polls when nobody is looking. `status`
+// keeps reconciling exactly as before — the headless path is unchanged.
+// ---------------------------------------------------------------------------
+
+const LEASE_TTL_MS = 20_000
+const LEASE_SWEEP_MS = 5_000
+const LEASE_DEBOUNCE_MS = 500
+
+/** @type {Map<string, {watchers: any[], lastBeat: number, deb: any, sweep: any, busy: boolean, pending: boolean}>} */
+const leases = new Map()
+
+function isDocflowState(state) {
+  return !!state && state.kind === 'docflow' && Array.isArray(state.doc_roots)
+}
+
+/** Fresh read of state, one discovery diff, persist + re-render only if it changed. */
+async function leaseReconcile(statePath) {
+  const state = await readJson(statePath)
+  if (!isDocflowState(state)) return false
+  const cwd = path.dirname(path.dirname(statePath))
+  if (!(await discoverDocs(cwd, state))) return false
+  state.updatedAt = now()
+  await writeJson(statePath, state)
+  await renderIndex(path.dirname(statePath), state)
+  return true
+}
+
+function leaseNote(statePath) {
+  const lease = leases.get(statePath)
+  if (!lease) return
+  if (lease.deb) clearTimeout(lease.deb)
+  lease.deb = setTimeout(() => {
+    lease.deb = null
+    if (lease.busy) {
+      lease.pending = true
+      return
+    }
+    lease.busy = true
+    leaseReconcile(statePath)
+      .catch(() => {})
+      .then(() => {
+        lease.busy = false
+        if (lease.pending) {
+          lease.pending = false
+          leaseNote(statePath)
+        }
+      })
+  }, LEASE_DEBOUNCE_MS)
+  if (lease.deb.unref) lease.deb.unref()
+}
+
+async function leaseArm(statePath, lease) {
+  const state = await readJson(statePath)
+  if (!isDocflowState(state)) return false
+  const cwd = path.dirname(path.dirname(statePath))
+  for (const rootRel of state.doc_roots) {
+    const abs = path.resolve(cwd, rootRel)
+    let st = null
+    try {
+      st = await fs.stat(abs)
+    } catch {}
+    if (!st || !st.isDirectory()) continue // file roots and missing roots: status still reconciles them on demand
+    try {
+      const w = fsWatch(abs, { recursive: true }, () => leaseNote(statePath))
+      w.on('error', () => {})
+      lease.watchers.push(w)
+    } catch {}
+  }
+  if (lease.watchers.length === 0) {
+    // No watchable dir root: fall back to watching the workspace root dir so
+    // first-time file creation inside a not-yet-created doc dir still wakes up.
+    try {
+      const w = fsWatch(cwd, { recursive: true }, () => leaseNote(statePath))
+      w.on('error', () => {})
+      lease.watchers.push(w)
+    } catch {}
+  }
+  return true
+}
+
+/** Renew (or take) the lease for one workflow state file. Resolves after the
+ *  first-heartbeat reconcile, so callers/tests can await the catch-up diff. */
+async function leaseHeartbeat(statePath) {
+  let lease = leases.get(statePath)
+  let first = false
+  if (!lease) {
+    lease = { watchers: [], lastBeat: Date.now(), deb: null, sweep: null, busy: false, pending: false }
+    leases.set(statePath, lease)
+    first = true
+    if (!(await leaseArm(statePath, lease))) {
+      leaseRelease(statePath)
+      return false
+    }
+  }
+  lease.lastBeat = Date.now()
+  if (!lease.sweep) {
+    lease.sweep = setInterval(() => {
+      const l = leases.get(statePath)
+      if (l && Date.now() - l.lastBeat > LEASE_TTL_MS) leaseRelease(statePath)
+    }, LEASE_SWEEP_MS)
+    if (lease.sweep.unref) lease.sweep.unref()
+  }
+  if (first) await leaseReconcile(statePath).catch(() => {})
+  return true
+}
+
+function leaseRelease(statePath) {
+  const lease = leases.get(statePath)
+  if (!lease) return false
+  if (lease.sweep) clearInterval(lease.sweep)
+  if (lease.deb) clearTimeout(lease.deb)
+  for (const w of lease.watchers) {
+    try {
+      w.close()
+    } catch {}
+  }
+  lease.watchers.length = 0
+  leases.delete(statePath)
+  return true
+}
+
+function leaseCount() {
+  return leases.size
+}
+
+function leaseReleaseAll() {
+  for (const p of [...leases.keys()]) leaseRelease(p)
+}
+
+/** Test/exported surface — e2e drives the lease machinery headlessly (no HTTP). */
+export const leaseApi = { heartbeat: leaseHeartbeat, release: leaseRelease, count: leaseCount, releaseAll: leaseReleaseAll, reconcile: leaseReconcile }
+
+// --- loopback trust fence (same semantics the workbench plugin uses) --------
+
+function isLoopbackRequest(req) {
+  const address = req.socket && req.socket.remoteAddress
+  if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false
+  const host = req.headers && req.headers.host
+  if (typeof host !== 'string') return false
+  let url
+  try {
+    url = new URL(`http://${host}`)
+  } catch {
+    return false
+  }
+  if (url.hostname !== '127.0.0.1' && url.hostname !== 'localhost' && url.hostname !== '[::1]') return false
+  if (req.headers['sec-fetch-site'] === 'cross-site') return false
+  const origin = req.headers.origin
+  if (origin === undefined) return true
+  try {
+    return new URL(origin).host === url.host
+  } catch {
+    return false
+  }
+}
+
+function leaseRespond(res, status, body) {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  })
+  res.end(JSON.stringify(body))
+}
+
+async function readJsonBody(req, maxBytes = 16 * 1024) {
+  const chunks = []
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > maxBytes) return undefined
+    chunks.push(chunk)
+  }
+  if (chunks.length === 0) return undefined
+  try {
+    const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    return parsed && typeof parsed === 'object' ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * POST /api/docflow/lease  body {sessionId, file}
+ * `file` is the workspace-relative state path the panel is watching (e.g.
+ * '.doc-workflow/state.json'); the session's working directory anchors it, so
+ * a caller can never point the watcher at an arbitrary path.
+ */
+function makeLeaseRoute(ctx) {
+  return {
+    method: 'POST',
+    path: '/api/docflow/lease',
+    handler: async (req, res) => {
+      try {
+        if (!isLoopbackRequest(req)) return leaseRespond(res, 403, { ok: false, error: 'loopback only' })
+        const body = await readJsonBody(req)
+        if (!body || typeof body.sessionId !== 'string' || typeof body.file !== 'string')
+          return leaseRespond(res, 400, { ok: false, error: 'lease requires {sessionId, file}' })
+        const session = ctx.sessions.get(body.sessionId)
+        const wd = ctx.workingDirectory
+        const dir = session ? wd.get(session) : wd.defaultDirectory
+        if (!dir) return leaseRespond(res, 404, { ok: false, error: 'unknown session' })
+        const rel = path.normalize(body.file)
+        if (path.isAbsolute(rel) || rel.startsWith('..') || !rel.endsWith('state.json'))
+          return leaseRespond(res, 400, { ok: false, error: 'file must be a workspace-relative <dir>/state.json path' })
+        const statePath = path.resolve(dir, rel)
+        if (!statePath.startsWith(path.resolve(dir) + path.sep)) return leaseRespond(res, 400, { ok: false, error: 'outside workspace' })
+        const ok = await leaseHeartbeat(statePath)
+        return leaseRespond(res, ok ? 200 : 404, { ok })
+      } catch {
+        return leaseRespond(res, 500, { ok: false, error: 'lease failed' })
+      }
+    },
+  }
+}
+
 export function apply(ctx) {
   return ctx.effect(() => {
     const offTool = ctx.tools.register(makeTool(ctx))
     const offPrompt = ctx.systemPrompt.section(PROMPT_SECTION)
+    // v1.3.4: the lease route needs webServer, which is an OPTIONAL host
+    // service (CLI harnesses may not provide it) — lazy ctx.inject with a
+    // callback never fires when the service is absent, exactly like the
+    // dsh-plugin hub routes. Do NOT add webServer to the required inject list.
+    if (typeof ctx.inject === 'function') {
+      ctx.inject(['webServer'], (host) => {
+        host.effect(() => {
+          const offRoute = host.webServer.register(makeLeaseRoute(ctx))
+          return () => {
+            offRoute()
+            leaseReleaseAll()
+          }
+        }, 'docflow: panel lease route')
+      })
+    }
     return () => {
       offTool()
       offPrompt()
+      leaseReleaseAll()
     }
   })
 }
