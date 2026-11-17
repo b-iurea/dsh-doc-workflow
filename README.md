@@ -57,19 +57,23 @@ flowchart TD
 
 ## Install
 
-In a DeepSeek Harness session, install the bundle directory:
+From npm (any DSH instance — host tool + panel, no checkout needed): open the plugin manager (Discover / market) and install **`dsh-doc-workflow`**, or from a session:
 
 ```
-plugin_manager install_bundle <path-to>/doc-workflow-plugin
+plugin_manager install_bundle dsh-doc-workflow
 ```
 
-Or add to your profile pack the patch row:
+Or add the bundle row to your profile pack:
 
 ```yaml
 - insert:
     - id: doc-workflow
-      name: '@local/doc-workflow'
+      name: 'dsh-doc-workflow'
 ```
+
+From a local checkout (development): `plugin_manager install_bundle <path-to>/doc-workflow-plugin` — or keep a `link:` dependency to the checkout while iterating.
+
+> **Migration from the pre-1.3.6 local bundle**: if this plugin was previously installed as `@local/doc-workflow`, disable that entry once the npm one is enabled — they would register two sidebar tabs. Workflow state on disk (`.doc-workflow/` folders) is untouched by the rename.
 
 ## Use
 
@@ -103,8 +107,10 @@ DESIGN-v3.1.md        implementation contract for emit_tasks / task drafts (v3.1
 DESIGN-v1.3.1.md      implementation contract for reflow / step-level restart (v1.3.1)
 DESIGN-v1.3.4.md      implementation contract for v1.3.4: auto-discovery + selective re-read + panel-lifetime watcher
 DESIGN-v1.3.5.md      bugfix contract: verify-passing consumes the pending-documents round (v1.3.5)
+DESIGN-v1.3.6.md      infra contract: npm rename + tag-triggered publish pipeline (v1.3.6)
 test/e2e.mjs          headless regression suite (+ test/docs fixtures)
 .github/workflows/ci.yml   GitHub Actions: npm run check + npm test on Node 20/22/24
+.github/workflows/publish.yml  GitHub Actions: tag vX.Y.Z → version guard → tests → npm publish
 ```
 
 MIT © b-iurea

@@ -1,0 +1,39 @@
+name: publish
+
+# One trigger, one truth: the annotated tag pushed after each human merge
+# (AGENTS.md release rule) is what puts a version on npm. The guard below
+# refuses any tag whose version does not equal package.json.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Version guard (tag vX.Y.Z must equal package.json version)
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${PKG} — refusing to publish"
+            exit 1
+          fi
+      # no npm dependencies: plain ESM bundle; check + e2e run straight from source
+      - name: Syntax check
+        run: npm run check
+      - name: Headless e2e workflow suite
+        run: npm test
+      - name: Shipped files preview
+        run: npm pack --dry-run
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
