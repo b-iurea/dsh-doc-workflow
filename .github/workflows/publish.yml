@@ -33,7 +33,29 @@ jobs:
         run: npm test
       - name: Shipped files preview
         run: npm pack --dry-run
+      # npm publishes a brand-new package in two steps (PUT staged -> POST finalize).
+      # If the PUT succeeds server-side but its response is lost, npm retries the PUT
+      # and the registry answers E409 "Cannot publish over previously staged version"
+      # — the step exits 1 while the registry finalizes the very same publish seconds
+      # later (observed on v1.3.6, run 44319472716: registry has 1.3.6, run is red).
+      # The fallback below turns that false negative green by confirming the exact
+      # version is on the registry; any other failure keeps its exit code.
       - name: Publish to npm
-        run: npm publish --access public
+        run: |
+          set +e
+          npm publish --access public
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            PKG=$(node -p "require('./package.json').name")
+            VER=$(node -p "require('./package.json').version")
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/${PKG}/${VER}")
+            if [ "$code" = "200" ]; then
+              echo "::warning::npm publish exited ${rc}, but ${PKG}@${VER} is present on the registry (staged-publish 409 after a lost response) — treating as published"
+              exit 0
+            fi
+            echo "::error::npm publish exited ${rc} and ${PKG}@${VER} is not on the registry (HTTP ${code})"
+            exit $rc
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
