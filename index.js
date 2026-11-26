@@ -69,6 +69,50 @@ const GATE_DOCS = {
   interview: { file: 'questions-interview.md', header: '# Interview questions\n\n' },
 }
 
+// v1.4.0 (issue #17): typed review notes. A QUESTION type was rejected by design —
+// questions belong to the gates; notes are the user's statements. FACT is the one type
+// that joins the consistency matrix (it is a human source, attestable by construction).
+const NOTE_TYPES = ['FACT', 'SUGGESTION', 'GUIDANCE', 'CONSTRAINT']
+const NOTE_ARTIFACTS = ['plan', 'notes', 'objective']
+const NOTE_BODY_MAX = 4000
+
+function validNoteId(id) {
+  return typeof id === 'string' && /^NOTE\d+$/.test(id)
+}
+
+function validSupId(id) {
+  return typeof id === 'string' && /^SUP\d+$/.test(id)
+}
+
+function nextNoteId(state) {
+  let max = 0
+  for (const n of state.notes || []) {
+    if (typeof n.id === 'string' && n.id.startsWith('NOTE')) max = Math.max(max, Number(n.id.slice(4)) || 0)
+  }
+  return `NOTE${max + 1}`
+}
+
+function nextSupId(state) {
+  let max = 0
+  for (const s of state.supersedions || []) {
+    if (typeof s.id === 'string' && s.id.startsWith('SUP')) max = Math.max(max, Number(s.id.slice(3)) || 0)
+  }
+  return `SUP${max + 1}`
+}
+
+/** target existence against a freshly-read state: entry id, emitted preset role, or artifact.
+ *  Returns an error string, undefined when the target is valid. */
+function noteTargetError(state, target) {
+  if (typeof target !== 'string' || target.trim() === '')
+    return 'note.target is required: an index entry id (U…/N…), an emitted role name, or plan|notes|objective'
+  const t = target.trim()
+  if (NOTE_ARTIFACTS.includes(t)) return undefined
+  if (validId(t)) return state.entries[t] ? undefined : `note.target ${t} is not an existing index entry`
+  const roles = state.presets && Array.isArray(state.presets.cards) ? state.presets.cards.map((c) => c.role) : []
+  if (roles.includes(t)) return undefined
+  return `note.target "${t}" is not an existing entry id, an emitted role (${roles.length ? roles.join(', ') : 'none emitted'}), or plan|notes|objective`
+}
+
 // v1.3.1 §1: the reflow ladder — re-run step X, invalidate downstream artifacts.
 // 'recheck' is the failed-verify parking position for indexing; 'done' sits past
 // the ladder (pos 99) so every target is legal from it. no-workflow (no state) is N/A.
@@ -95,22 +139,52 @@ function factValues(text) {
   return out
 }
 
-/** all unordered pairs of useful entries — the logical consistency matrix */
-function usefulPairs(state) {
-  const ids = Object.keys(state.entries).filter((id) => state.entries[id].useful).sort()
-  const pairs = []
-  for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) pairs.push([ids[i], ids[j]])
-  return pairs
-}
-
 function pairKey(a, b) {
   return [a, b].sort().join('|')
 }
 
+/** v1.4.0 (issue #17): matrix members — useful non-superseded entries + open FACT notes.
+ *  The pairs are U×U plus F×U (every FACT against every useful entry): the human source is
+ *  cross-checked against the extracted index, and superseded entries leave the matrix. */
+function matrixMembers(state) {
+  const entries = Object.keys(state.entries)
+    .filter((id) => state.entries[id].useful && !state.entries[id].superseded)
+    .sort()
+  const facts = (state.notes || []).filter((n) => n.type === 'FACT' && n.status === 'open').map((n) => n.id).sort()
+  return { entries, facts }
+}
+
+function consistencyLayout(state) {
+  const c = state.consistency
+  const { entries, facts } = matrixMembers(state)
+  const pairs = []
+  for (let i = 0; i < entries.length; i++) for (let j = i + 1; j < entries.length; j++) pairs.push([entries[i], entries[j]])
+  for (const f of facts) for (const e of entries) pairs.push([f, e])
+  const missing = pairs.filter(([a, b]) => !c.verdicts[pairKey(a, b)]).map(([a, b]) => pairKey(a, b))
+  const conflicts = pairs
+    .filter(([a, b]) => c.verdicts[pairKey(a, b)] && c.verdicts[pairKey(a, b)].verdict === 'conflict')
+    .map(([a, b]) => ({ pair: pairKey(a, b), note: c.verdicts[pairKey(a, b)].note }))
+  return { pairs, missing, conflicts }
+}
+
+/** membership test for crosscheck verdicts: entries (useful, not superseded) + open FACT notes */
+function matrixMemberSet(state) {
+  const { entries, facts } = matrixMembers(state)
+  return new Set([...entries, ...facts])
+}
+
+/** display text for a matrix member (entry content+quote, or the FACT note body) */
+function matrixText(state, id) {
+  const e = state.entries[id]
+  if (e) return `${e.content} ${e.source_quote || ''}`
+  const n = (state.notes || []).find((x) => x.id === id)
+  return n ? n.body : ''
+}
+
 /** mechanical value-mismatch hints for a pair (informational aid, not blocking) */
 function pairHints(state, a, b) {
-  const fa = factValues(`${state.entries[a].content} ${state.entries[a].source_quote || ''}`)
-  const fb = factValues(`${state.entries[b].content} ${state.entries[b].source_quote || ''}`)
+  const fa = factValues(matrixText(state, a))
+  const fb = factValues(matrixText(state, b))
   const hints = []
   for (const p of FACT_PATTERNS) {
     const va = fa[p.kind] || []
@@ -121,16 +195,6 @@ function pairHints(state, a, b) {
     hints.push(`${p.kind} differ: ${a}[${va.join(', ')}] vs ${b}[${vb.join(', ')}]`)
   }
   return hints
-}
-
-function consistencyLayout(state) {
-  const c = state.consistency
-  const pairs = usefulPairs(state)
-  const missing = pairs.filter(([a, b]) => !c.verdicts[pairKey(a, b)]).map(([a, b]) => pairKey(a, b))
-  const conflicts = pairs
-    .filter(([a, b]) => c.verdicts[pairKey(a, b)] && c.verdicts[pairKey(a, b)].verdict === 'conflict')
-    .map(([a, b]) => ({ pair: pairKey(a, b), note: c.verdicts[pairKey(a, b)].note }))
-  return { pairs, missing, conflicts }
 }
 
 function recomputeConsistency(state) {
@@ -183,9 +247,13 @@ async function renderConsistency(dirAbs, state) {
   for (const [a, b] of pairs) {
     const v = c.verdicts[pairKey(a, b)]
     const hints = pairHints(state, a, b)
-    const ea = state.entries[a]
-    const eb = state.entries[b]
-    md += `## ${a} ↔ ${b}\n\n- **${a}** ${ea.title} (${ea.source_kind || 'doc'}): ${ea.content}\n- **${b}** ${eb.title} (${eb.source_kind || 'doc'}): ${eb.content}\n`
+    const label = (id) => {
+      const e = state.entries[id]
+      if (e) return `**${id}** ${e.title} (${e.source_kind || 'doc'}): ${e.content}`
+      const n = (state.notes || []).find((x) => x.id === id)
+      return n ? `**${id}** (FACT note by the human on \`${n.target}\`): ${n.body}` : `**${id}**`
+    }
+    md += `## ${a} ↔ ${b}\n\n- ${label(a)}\n- ${label(b)}\n`
     if (hints.length) {
       md += '- ⚠ mechanical value hints: ' + hints.join('; ') + '\n'
     }
@@ -198,10 +266,30 @@ async function renderConsistency(dirAbs, state) {
 
 /** in-place upgrade of pre-current states; returns true if something changed */
 function migrateState(state) {
-  if (state.version === STATE_VERSION && state.consistency && state.gates && state.gates.interview && state.interview && state.presets) return false
+  if (
+    state.version === STATE_VERSION &&
+    state.consistency &&
+    state.gates &&
+    state.gates.interview &&
+    state.interview &&
+    state.presets &&
+    Array.isArray(state.notes) &&
+    Array.isArray(state.supersedions)
+  )
+    return false
   let dirty = false
   if (!state.consistency) {
     state.consistency = { status: 'n/a', verdicts: {}, updatedAt: undefined }
+    dirty = true
+  }
+  // v1.4.0 (issue #17): notes + supersedions shells (additive blocks, version stays 3 —
+  // the v3.1 tasks precedent: fill on load, never bump for additive state)
+  if (!Array.isArray(state.notes)) {
+    state.notes = []
+    dirty = true
+  }
+  if (!Array.isArray(state.supersedions)) {
+    state.supersedions = []
     dirty = true
   }
   for (const e of Object.values(state.entries)) {
@@ -358,6 +446,35 @@ async function renderIndex(dirAbs, state) {
     for (const d of state.discoveredDocs) out.push(`- \`${d.path}\` (${d.kind}, seen ${d.seenAt})`)
     out.push('')
   }
+  // v1.4.0 (issue #17): Review notes section — grouped by target, superseded last
+  const notes = state.notes || []
+  const sups = state.supersedions || []
+  if (notes.length || sups.length) {
+    out.push('## Review notes', '')
+    const alive = notes.filter((n) => n.status !== 'superseded')
+    const dead = notes.filter((n) => n.status === 'superseded')
+    const byTarget = new Map()
+    for (const n of alive) {
+      if (!byTarget.has(n.target)) byTarget.set(n.target, [])
+      byTarget.get(n.target).push(n)
+    }
+    if (alive.length === 0) out.push('_none active_', '')
+    for (const [target, list] of byTarget) {
+      out.push(`### On \`${target}\``, '')
+      for (const n of list) out.push(`- **${n.id}** · ${n.type} · ${n.status} (${n.at}): ${n.body}`)
+      out.push('')
+    }
+    if (dead.length) {
+      out.push('### Superseded notes', '')
+      for (const n of dead) out.push(`- **${n.id}** · ${n.type} · superseded (${n.at}): ${n.body}`)
+      out.push('')
+    }
+    if (sups.length) {
+      out.push('### Supersessions', '')
+      for (const s of sups) out.push(`- **${s.id}** ${s.kind}: \`${s.fromId}\` superseded by \`${s.toId}\` (${s.at})`)
+      out.push('')
+    }
+  }
   await fs.writeFile(path.join(dirAbs, 'index.md'), out.join('\n'), 'utf8')
 }
 
@@ -424,6 +541,28 @@ function guidanceFor(state) {
     default:
       g.push('Call action=start with the objective and doc_roots.')
   }
+  // v1.4.0 (issue #17): open notes are surfaced at every stage; FACTs drive the F×U matrix;
+  // CONSTRAINTS are re-surfaced where they bind (interview proposal, plan writing)
+  const notes = state.notes || []
+  const openNotes = notes.filter((n) => n.status === 'open')
+  if (openNotes.length) {
+    const clip = (s) => (s.length > 60 ? s.slice(0, 60) + '…' : s)
+    const listed = openNotes.slice(0, 6).map((n) => `${n.id}→${n.target} (${n.type}): "${clip(n.body)}"`)
+    g.push(
+      `OPEN NOTES (${openNotes.length}): ${listed.join('; ')}${openNotes.length > 6 ? '; …' : ''}. These are the user's own statements — acknowledge them; when one is consumed, mark it with action=note note_action=address id=<NOTE…> (open ids: ${openNotes.map((n) => n.id).join(', ')}).`,
+    )
+    const facts = openNotes.filter((n) => n.type === 'FACT')
+    if (facts.length && ['indexing', 'consistency', 'recheck'].includes(state.stage))
+      g.push(`FACT NOTES (${facts.map((f) => f.id).join(', ')}) join the consistency matrix as human-sourced pairs against every useful entry: run verify, then crosscheck the ${facts.map((f) => f.id).join('/') + '|U…'} pairs (crosscheck a/b accept NOTE ids). A conflict naming a FACT asks the user whether the fact replaces the entry; record the answer with action=note note_action=supersede.`)
+    const cons = openNotes.filter((n) => n.type === 'CONSTRAINT')
+    if (cons.length && (state.stage === 'interview' || state.stage === 'plan'))
+      g.push(`OPEN CONSTRAINTS (re-surfaced): ${cons.map((n) => `${n.id}→${n.target}: ${clip(n.body)}`).join('; ')} — honor these in the ${state.stage === 'interview' ? 'interview proposal' : 'plan'}.`)
+  }
+  if (state.stage === 'consistency') {
+    const factConf = consistencyLayout(state).conflicts.filter((cf) => cf.pair.split('|').some((p) => validNoteId(p)))
+    if (factConf.length)
+      g.push(`FACT CONFLICT on ${factConf.map((c) => c.pair).join(', ')}: ask the user (ask_user_question) whether the fact replaces the entry; on yes record action=note note_action=supersede supersede={fact:"NOTE…", entry:"U…", winner:"fact"|"entry"} — the supersession resolves the conflict and unblocks the matrix.`)
+  }
   if (state.discoveredDocs && state.discoveredDocs.length) {
     const list = state.discoveredDocs.map((d) => `\`${d.path}\` (${d.kind})`).join(', ')
     g.push(`AUTO-DISCOVERY: ${state.discoveredDocs.length} file(s) under doc_roots are new or changed since the last ingest — ${list}. Surface this to the user and, once they acknowledge, call action=ingest with these paths to enter them in the flow. Do not ingest without the user's acknowledgement.`)
@@ -442,6 +581,7 @@ function statusPayload(state, dirAbs) {
     entries: {
       useful: entries.filter((e) => e.useful).length,
       not_useful: entries.filter((e) => !e.useful).length,
+      superseded: entries.filter((e) => e.superseded).length,
     },
     gates: {
       understanding: gateSummary(state, 'understanding'),
@@ -476,6 +616,9 @@ function statusPayload(state, dirAbs) {
       const cl = consistencyLayout(state)
       return { status: state.consistency.status, pairs: cl.pairs.length, missing: cl.missing, conflicts: cl.conflicts }
     })(),
+    // v1.4.0 (issue #17): typed notes + supersession history (the panel renders both)
+    notes: (state.notes || []).map((n) => ({ id: n.id, target: n.target, type: n.type, status: n.status, body: n.body, set_at: n.at })),
+    supersedions: state.supersedions || [],
     pending_docs: state.pendingDocs || [],
     // v1.3.2 (issue #11): files discovered by the last scan, awaiting ingest.
     discovered: (state.discoveredDocs || []).map((d) => ({ path: d.path, kind: d.kind, seen_at: d.seenAt })),
@@ -515,6 +658,9 @@ function freshState(objective, docRoots, dirName) {
     verification: { status: 'unverified', lastRun: undefined, failed: [], unanchored: [], unattested: [] },
     consistency: { status: 'n/a', verdicts: {}, updatedAt: undefined },
     entries: {},
+    // v1.4.0 (issue #17): typed review notes (NOTE…) + supersession records (SUP…)
+    notes: [],
+    supersedions: [],
     pendingDocs: [],
     // v1.3.2 (issue #11): mtime/size manifest of doc_roots taken at start/ingest, plus the
     // auto-discovered new/changed files still waiting for an ingest acknowledgement.
@@ -632,6 +778,7 @@ async function verifyEntries(cwd, state) {
   const suspect = []
   const externals = []
   for (const [id, e] of Object.entries(state.entries)) {
+    if (e.superseded) continue // v1.4.0: superseded entries leave the integrity check (kept as history)
     let status = 'unanchored'
     let detail = 'no verbatim quote: content is assumed — not allowed'
     const hasQuote = typeof e.source_quote === 'string' && e.source_quote.trim() !== ''
@@ -821,6 +968,141 @@ function tasksPointer(state) {
   const t = state.tasks
   if (!t) return 'pending'
   return t.status === 'emitted' ? `emitted ${(t.items || []).length}` : 'skipped'
+}
+
+// ---------------------------------------------------------------------------
+// v1.4.0 (issue #17): review notes — shared mutation core (tool + route parity)
+// ---------------------------------------------------------------------------
+
+/** Mutates `state` in place for note add/address/supersede/restore; returns
+ *  { ok, ...payload, touchesMatrix } — the caller persists. `list` is read-only. */
+function noteMutate(state, action, payload) {
+  switch (action) {
+    case 'add': {
+      const n = payload.note
+      if (!n || typeof n !== 'object') return { ok: false, error: 'note add requires note: {target, type, body}.' }
+      const terr = noteTargetError(state, n.target)
+      if (terr) return { ok: false, error: terr }
+      if (!NOTE_TYPES.includes(n.type))
+        return { ok: false, error: `note.type must be one of ${NOTE_TYPES.join(', ')} (a QUESTION is the gates' job, not a note).` }
+      const body = typeof n.body === 'string' ? n.body.trim() : ''
+      if (body === '') return { ok: false, error: 'note.body is required (the statement itself).' }
+      if (body.length > NOTE_BODY_MAX) return { ok: false, error: `note.body exceeds ${NOTE_BODY_MAX} characters.` }
+      const rec = { id: nextNoteId(state), target: String(n.target).trim(), type: n.type, body, author: 'human', at: now(), status: 'open' }
+      state.notes.push(rec)
+      return { ok: true, note: rec, touchesMatrix: rec.type === 'FACT' }
+    }
+    case 'address': {
+      if (!validNoteId(payload.id)) return { ok: false, error: 'note address requires id: a NOTE… id.' }
+      const rec = state.notes.find((x) => x.id === payload.id)
+      if (!rec) return { ok: false, error: `Unknown note id ${payload.id}.` }
+      if (rec.status !== 'open') return { ok: false, error: `Note ${payload.id} is already ${rec.status}.` }
+      rec.status = 'addressed'
+      rec.addressedAt = now()
+      return { ok: true, note: rec, touchesMatrix: rec.type === 'FACT' }
+    }
+    case 'supersede': {
+      const sp = payload.supersede
+      if (!sp || !validNoteId(sp.fact) || !validId(sp.entry))
+        return { ok: false, error: 'note supersede requires supersede: {fact: NOTE…, entry: U…|N…, winner: "fact"|"entry"}.' }
+      if (sp.winner !== 'fact' && sp.winner !== 'entry')
+        return { ok: false, error: 'supersede.winner must be "fact" (the fact replaces the entry) or "entry" (the fact is dropped).' }
+      const note = state.notes.find((x) => x.id === sp.fact)
+      if (!note) return { ok: false, error: `Unknown note id ${sp.fact}.` }
+      if (note.type !== 'FACT') return { ok: false, error: `Note ${sp.fact} is a ${note.type} note: only FACT notes can supersede entries.` }
+      const entry = state.entries[sp.entry]
+      if (!entry) return { ok: false, error: `Unknown entry id ${sp.entry}.` }
+      if (entry.superseded) return { ok: false, error: `Entry ${sp.entry} is already superseded (by ${entry.superseded.by}).` }
+      const key = pairKey(sp.fact, sp.entry)
+      const v = state.consistency.verdicts[key]
+      if (!v || v.verdict !== 'conflict')
+        return { ok: false, error: `Supersession requires a recorded conflict verdict on ${key} — run crosscheck first, then ask the user.` }
+      const sup = {
+        id: nextSupId(state),
+        kind: sp.winner === 'fact' ? 'entry→fact' : 'fact→entry',
+        fromId: sp.winner === 'fact' ? sp.entry : sp.fact,
+        toId: sp.winner === 'fact' ? sp.fact : sp.entry,
+        at: now(),
+      }
+      if (sp.winner === 'fact') {
+        entry.superseded = { by: sp.fact, sup: sup.id, at: sup.at }
+        entry.updatedAt = now()
+        note.status = 'addressed'
+        note.addressedAt = now()
+      } else {
+        note.status = 'superseded'
+      }
+      state.supersedions.push(sup)
+      return { ok: true, supersession: sup, touchesMatrix: true }
+    }
+    case 'restore': {
+      if (!validSupId(payload.id)) return { ok: false, error: 'note restore requires id: a SUP… supersession id.' }
+      const idx = state.supersedions.findIndex((s) => s.id === payload.id)
+      if (idx === -1) return { ok: false, error: `Unknown supersession id ${payload.id}.` }
+      const sup = state.supersedions[idx]
+      state.supersedions.splice(idx, 1)
+      if (state.entries[sup.fromId]) {
+        delete state.entries[sup.fromId].superseded
+        state.entries[sup.fromId].updatedAt = now()
+      }
+      const loserNote = state.notes.find((x) => x.id === sup.fromId)
+      if (loserNote) loserNote.status = 'open'
+      // the winning FACT note is withdrawn with the supersession (issue #17 restore semantics)
+      if (validNoteId(sup.toId)) state.notes = state.notes.filter((x) => x.id !== sup.toId)
+      return { ok: true, restored: sup, touchesMatrix: true }
+    }
+    default:
+      return { ok: false, error: 'note_action must be add|list|address|restore|supersede.' }
+  }
+}
+
+/** Persist a noteMutate result: matrix bookkeeping + state.json + index.md.
+ *  Supersede/restore change the index basis: verification goes stale, presets/tasks take
+ *  the staleness chain, and the stage parks where the recomputed consistency says so. */
+async function persistNoteMutation(dirAbs, state, res) {
+  const out = {}
+  if (res.touchesMatrix) {
+    const sup = res.supersession || res.restored
+    if (sup) {
+      clearConsistencyFor(state, sup.fromId)
+      clearConsistencyFor(state, sup.toId)
+      state.verification.status = 'stale'
+      presetsStale(state)
+      const cl = consistencyLayout(state)
+      out.consistency = state.consistency.status
+      out.pairs = cl.pairs.length
+      await renderConsistency(dirAbs, state)
+      out.stage = state.stage = out.consistency === 'pending' ? 'consistency' : 'indexing'
+    } else {
+      clearConsistencyFor(state, res.note.id)
+      const cl = consistencyLayout(state)
+      out.consistency = state.consistency.status
+      out.pairs = cl.pairs.length
+      await renderConsistency(dirAbs, state)
+      if (res.note.type === 'FACT' && (out.consistency === 'passed' || out.consistency === 'n/a') && state.stage === 'consistency') {
+        if (state.gates.gaps.status === 'answered') afterGapsAnswered(state)
+        else {
+          state.stage = 'gaps'
+          state.gates.gaps.status = 'open'
+        }
+        out.stage = state.stage
+      }
+    }
+  } else if (res.note && res.note.type === 'FACT') {
+    // fresh FACT at a verified index: its F×U pairs are missing → consistency demotes to pending
+    const cl = consistencyLayout(state)
+    out.consistency = recomputeConsistency(state)
+    out.pairs = cl.pairs.length
+    await renderConsistency(dirAbs, state)
+    if (out.consistency === 'pending' && state.verification.status === 'passed') {
+      state.stage = 'consistency'
+      out.stage = state.stage
+    }
+  }
+  state.updatedAt = now()
+  await writeJson(path.join(dirAbs, 'state.json'), state)
+  await renderIndex(dirAbs, state)
+  return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,7 +1314,7 @@ async function runDocflow(ctx, exec, args) {
       for (const id of targets) {
         const e = state.entries[id]
         if (!e) return fail(`Unknown entry id ${id}.`)
-        e.attest = { verdict: args.verdict, note: args.note, at: now() }
+        e.attest = { verdict: args.verdict, note: args.attest_note !== undefined ? args.attest_note : args.note, at: now() }
       }
       state.verification.status = 'stale'
       presetsStale(state)
@@ -1106,13 +1388,19 @@ async function runDocflow(ctx, exec, args) {
     case 'crosscheck': {
       if (state.verification.status !== 'passed') return fail('The consistency matrix opens only after verify (integrity) passes.', guidanceFor(state).join(' '))
       if (!Array.isArray(args.verdicts) || args.verdicts.length === 0) return fail('crosscheck requires verdicts: [{a, b, verdict: consistent|conflict, note?}].')
-      const validPairs = new Set(usefulPairs(state).map(([a, b]) => pairKey(a, b)))
+      const layout = consistencyLayout(state)
+      const validPairs = new Set(layout.pairs.map(([a, b]) => pairKey(a, b)))
+      const members = matrixMemberSet(state)
       const stored = []
       for (const v of args.verdicts) {
-        if (!validId(v.a) || !validId(v.b) || !state.entries[v.a] || !state.entries[v.b]) return fail(`crosscheck verdict references unknown entry: ${v.a} / ${v.b}.`)
-        if (!state.entries[v.a].useful || !state.entries[v.b].useful) return fail('Only useful entries take part in the consistency matrix.')
+        const known = (x) => (validId(x) && state.entries[x]) || validNoteId(x)
+        if (!known(v.a) || !known(v.b)) return fail(`crosscheck verdict references unknown matrix member: ${v.a} / ${v.b}.`)
+        if (!members.has(v.a) || !members.has(v.b))
+          return fail('Only useful non-superseded entries and open FACT notes take part in the consistency matrix.')
+        if (v.a === v.b) return fail('A pair needs two distinct members.')
         if (v.verdict !== 'consistent' && v.verdict !== 'conflict') return fail('Each verdict must be "consistent" or "conflict".')
         const k = pairKey(v.a, v.b)
+        if (!validPairs.has(k)) return fail(`crosscheck verdict ${k} is not a pair in the current matrix (pairs: ${[...validPairs].join(', ') || 'none'}).`)
         state.consistency.verdicts[k] = { verdict: v.verdict, note: typeof v.note === 'string' ? v.note : undefined, at: now() }
         stored.push(k)
       }
@@ -1497,8 +1785,20 @@ async function runDocflow(ctx, exec, args) {
       return { ok: true, stage: state.stage, notes: path.join(dirAbs, 'NOTES.md'), plan: path.join(dirAbs, 'PLAN.md'), next: guidanceFor(state) }
     }
 
+    case 'note': {
+      // v1.4.0 (issue #17): typed review notes — add/list/address/restore/supersede
+      const sub = typeof args.note_action === 'string' ? args.note_action : 'add'
+      if (sub === 'list')
+        return { ok: true, notes: state.notes || [], supersedions: state.supersedions || [], consistency: state.consistency.status, stage: state.stage, next: guidanceFor(state) }
+      const res = noteMutate(state, sub, { note: args.note, id: args.id, supersede: args.supersede })
+      if (!res.ok) return fail(res.error, guidanceFor(state).join(' '))
+      const { touchesMatrix, ...payload } = res
+      const extra = await persistNoteMutation(dirAbs, state, res)
+      return { ok: true, ...payload, ...extra, next: guidanceFor(state) }
+    }
+
     default:
-      return fail(`Unknown action ${action}.`, 'Actions: status, start, gate_ask, gate_answer, add_entries, update_entry, remove_entry, attest, verify, crosscheck, emit_presets, emit_tasks, reflow, ingest, write_plan, reset.')
+      return fail(`Unknown action ${action}.`, 'Actions: status, start, gate_ask, gate_answer, add_entries, update_entry, remove_entry, attest, verify, crosscheck, emit_presets, emit_tasks, reflow, ingest, write_plan, note, supersede, reset.')
   }
 }
 
@@ -1512,13 +1812,15 @@ function makeTool(ctx) {
   description:
     'Document-driven workflow engine for project work: turn project documents into a source-verified index and a plan. ' +
     'Stage machine: start(objective, doc_roots) -> read docs -> understanding gate (ask the user via ask_user_question, then gate_ask/gate_answer phase=understanding) -> add_entries (useful/not-useful filtered info; every entry MUST carry a verbatim source_quote plus source_kind "doc" (project source_file) or "external" (source_ref URL/path) — assumed content is rejected) -> attest(ok|suspect; trusted for external sources after human review) trustworthiness -> verify = INTEGRITY check (source readable + quote found verbatim; unvouched external sources keep it from passing; failures send you back to re-read and fix) -> CONSISTENCY phase: crosscheck records one verdict per pair of useful entries (consistent|conflict); conflicts block the workflow until the entries are corrected and re-reviewed -> gaps gate (ask the user what information is missing to reach the objective, phase=gaps) -> interview gate (phase=interview: propose the agent roles + delivery type code/docs/answer-only, the user confirms via gate_answer with the interview payload) -> emit_presets writes source-backed agent role cards under agents/ + PRESETS.md (answer-only skips presets explicitly) -> write_plan(notes_md, plan_md) -> emit_tasks (TEAM BRIDGE, only when presets were emitted): team task drafts rendered to TASKS.md, each 1:1 mappable to team_task_create (subject/description/role/plan_phase/write_scopes/blocked_by), or an explicit skip via tasks=[] + skip_reason -> reflow(to_stage, paths?): re-run any step at or upstream of the current stage, invalidating downstream artifacts (entries and gates history are never silently dropped); with to_stage=reading an optional paths list narrows the re-read to the user-picked files (selective re-read scope, reported as reading_scope in status). ' +
-    'New documents arrive via ingest and re-enter the loop. status auto-discovers files under doc_roots that are new or changed since the last ingest (diffs an mtime/size manifest, on demand — no background polling) and keeps surfacing them in "discovered" + next guidance until you acknowledge with ingest; pre-ingest discovery never enters the flow by itself. status returns the current stage, gate/verification/consistency state and the exact next steps — follow its "next" guidance. The workflow state lives in a .doc-workflow/ folder in the session workspace (objective.md, index.md, questions-*.md, verification.md, consistency.md, agents/<role>.md, PRESETS.md, NOTES.md, PLAN.md, TASKS.md). Use this tool whenever asked to analyze project documents toward an objective, build/update index.md, verify source reliability or logical coherence, or write notes/plan from documentation.',
+    'New documents arrive via ingest and re-enter the loop. status auto-discovers files under doc_roots that are new or changed since the last ingest (diffs an mtime/size manifest, on demand — no background polling) and keeps surfacing them in "discovered" + next guidance until you acknowledge with ingest; pre-ingest discovery never enters the flow by itself. status returns the current stage, gate/verification/consistency state and the exact next steps — follow its "next" guidance. ' +
+    'REVIEW NOTES (v1.4.0): action=note records the user\'s typed notes on the workflow — note_action add with note {target, type: FACT|SUGGESTION|GUIDANCE|CONSTRAINT, body} (target = entry id U…/N…, emitted role name, or plan/notes/objective), list, address (id), restore (SUP… id), supersede (supersede {fact, entry, winner}). FACT notes are human-sourced: they need no quote, they join the consistency matrix as pairs against every useful entry, and a conflict with an entry is resolved by asking the user then recording the answer with supersede (winner fact|entry); restore inverts a supersession and withdraws the winning fact. The right-sidebar panel posts the same operations to POST /api/docflow/notes. ' +
+    'The workflow state lives in a .doc-workflow/ folder in the session workspace (objective.md, index.md, questions-*.md, verification.md, consistency.md, agents/<role>.md, PRESETS.md, NOTES.md, PLAN.md, TASKS.md). Use this tool whenever asked to analyze project documents toward an objective, build/update index.md, verify source reliability or logical coherence, or write notes/plan from documentation.',
   parameters: {
     type: 'object',
     properties: {
       action: {
         type: 'string',
-        enum: ['status', 'start', 'gate_ask', 'gate_answer', 'add_entries', 'update_entry', 'remove_entry', 'attest', 'verify', 'crosscheck', 'emit_presets', 'emit_tasks', 'reflow', 'ingest', 'write_plan', 'reset'],
+        enum: ['status', 'start', 'gate_ask', 'gate_answer', 'add_entries', 'update_entry', 'remove_entry', 'attest', 'verify', 'crosscheck', 'emit_presets', 'emit_tasks', 'reflow', 'ingest', 'write_plan', 'note', 'reset'],
       },
       objective: { type: 'string', description: 'start: the work objective as defined by the user.' },
       doc_roots: { type: 'array', items: { type: 'string' }, description: 'start: documents/directories to read.' },
@@ -1587,7 +1889,27 @@ function makeTool(ctx) {
         },
         description: 'add_entries: batch of filtered findings (keep batching; 1 call per reading session).',
       },
-      id: { type: 'string', description: 'update_entry/remove_entry: entry id like U3 or N1.' },
+      id: { type: 'string', description: 'update_entry/remove_entry: entry id like U3 or N1. note address/restore: NOTE…/SUP… id.' },
+      note_action: { type: 'string', enum: ['add', 'list', 'address', 'restore', 'supersede'], description: 'note: sub-action (default add).' },
+      note: {
+        type: 'object',
+        properties: {
+          target: { type: 'string', description: 'note add: target — an index entry id (U…/N…), an emitted preset role name, or an artifact: plan | notes | objective.' },
+          type: { type: 'string', enum: [...NOTE_TYPES], description: 'note add: FACT (a human-sourced statement, joins the consistency matrix against every useful entry) | SUGGESTION | GUIDANCE | CONSTRAINT.' },
+          body: { type: 'string', description: `note add: the statement itself (max ${NOTE_BODY_MAX} characters).` },
+        },
+        description: 'note add: the note to record {target, type, body}.',
+      },
+      supersede: {
+        type: 'object',
+        properties: {
+          fact: { type: 'string', description: 'FACT note id (NOTE…).' },
+          entry: { type: 'string', description: 'entry id (U…/N…) the fact conflicts with.' },
+          winner: { type: 'string', enum: ['fact', 'entry'], description: '"fact" = the fact replaces the entry; "entry" = the fact is dropped.' },
+        },
+        required: ['fact', 'entry', 'winner'],
+        description: 'note supersede: records the user answer to a FACT-vs-entry conflict (requires the conflict verdict from crosscheck).',
+      },
       fields: { type: 'object', description: 'update_entry: fields to replace (title, content, useful, source_kind, source_file, source_line, source_ref, source_quote, relevance).' },
       verdicts: {
         type: 'array',
@@ -1606,7 +1928,7 @@ function makeTool(ctx) {
       paths: { type: 'array', items: { type: 'string' }, description: 'ingest: new/changed documents. reflow (only with to_stage=reading): the files the user picked to re-read — the others keep their verification state; omit or empty restores the full reading.' },
       verdict: { type: 'string', enum: ['ok', 'suspect', 'trusted'], description: 'attest: your trustworthiness judgment. trusted = explicit human vouch required to clear an external (URL/path) source.' },
       ids: { type: 'array', items: { type: 'string' }, description: 'attest: entry ids or ["ALL"].' },
-      note: { type: 'string' },
+      attest_note: { type: 'string', description: 'attest: why this verdict (plain string; v1.4.0 renamed from note — `note` is now the review-note object).' },
       notes_md: { type: 'string', description: 'write_plan: notes content (markdown).' },
       plan_md: { type: 'string', description: 'write_plan: step-by-step plan to reach the objective (markdown).' },
       confirm: { type: 'string', description: 'reset only: "delete".' },
@@ -1666,20 +1988,41 @@ const LEASE_DEBOUNCE_MS = 500
 /** @type {Map<string, {watchers: any[], lastBeat: number, deb: any, sweep: any, busy: boolean, pending: boolean}>} */
 const leases = new Map()
 
+/** v1.4.0 (issue #17): per-state-file async mutex. The lease reconcile and the
+ *  notes route both do read-modify-write on state.json; serializing them per
+ *  path guarantees a note-add and a concurrent reconcile never lose a write. */
+const stateLocks = new Map()
+
+function withStateLock(statePath, fn) {
+  const prev = stateLocks.get(statePath) || Promise.resolve()
+  const run = prev.then(() => fn(), () => fn())
+  const guarded = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  stateLocks.set(statePath, guarded)
+  guarded.then(() => {
+    if (stateLocks.get(statePath) === guarded) stateLocks.delete(statePath)
+  })
+  return run
+}
+
 function isDocflowState(state) {
   return !!state && state.kind === 'docflow' && Array.isArray(state.doc_roots)
 }
 
 /** Fresh read of state, one discovery diff, persist + re-render only if it changed. */
 async function leaseReconcile(statePath) {
-  const state = await readJson(statePath)
-  if (!isDocflowState(state)) return false
-  const cwd = path.dirname(path.dirname(statePath))
-  if (!(await discoverDocs(cwd, state))) return false
-  state.updatedAt = now()
-  await writeJson(statePath, state)
-  await renderIndex(path.dirname(statePath), state)
-  return true
+  return withStateLock(statePath, async () => {
+    const state = await readJson(statePath)
+    if (!isDocflowState(state)) return false
+    const cwd = path.dirname(path.dirname(statePath))
+    if (!(await discoverDocs(cwd, state))) return false
+    state.updatedAt = now()
+    await writeJson(statePath, state)
+    await renderIndex(path.dirname(statePath), state)
+    return true
+  })
 }
 
 function leaseNote(statePath) {
@@ -1787,6 +2130,36 @@ function leaseReleaseAll() {
 /** Test/exported surface — e2e drives the lease machinery headlessly (no HTTP). */
 export const leaseApi = { heartbeat: leaseHeartbeat, release: leaseRelease, count: leaseCount, releaseAll: leaseReleaseAll, reconcile: leaseReconcile }
 
+/**
+ * v1.4.0 (issue #17): notes mutation for one state file, under the state lock:
+ * fresh read, validate, mutate, persist (state.json + index.md + consistency.md).
+ * Returns {status, body} — the route shape; exported as notesApi for headless tests.
+ */
+async function notesHandle(statePath, body) {
+  const action = body && typeof body.action === 'string' ? body.action : 'add'
+  if (!['add', 'list', 'address', 'supersede', 'restore'].includes(action))
+    return { status: 400, body: { ok: false, error: 'notes action must be add|list|address|supersede|restore.' } }
+  return withStateLock(statePath, async () => {
+    const state = await readJson(statePath)
+    if (!isDocflowState(state)) return { status: 404, body: { ok: false, error: 'not a docflow state file' } }
+    if (!Array.isArray(state.notes)) state.notes = []
+    if (!Array.isArray(state.supersedions)) state.supersedions = []
+    if (action === 'list')
+      return {
+        status: 200,
+        body: { ok: true, notes: state.notes, supersedions: state.supersedions, consistency: state.consistency.status, stage: state.stage, next: guidanceFor(state) },
+      }
+    const res = noteMutate(state, action, { note: body.note, id: body.id, supersede: body.supersede })
+    if (!res.ok) return { status: 400, body: { ok: false, error: res.error } }
+    const { touchesMatrix, ...payload } = res
+    const extra = await persistNoteMutation(path.dirname(statePath), state, res)
+    return { status: 200, body: { ok: true, ...payload, ...extra, next: guidanceFor(state) } }
+  })
+}
+
+/** Test/exported surface for the notes channel (route-free). */
+export const notesApi = { handle: notesHandle }
+
 // --- loopback trust fence (same semantics the workbench plugin uses) --------
 
 function isLoopbackRequest(req) {
@@ -1871,6 +2244,39 @@ function makeLeaseRoute(ctx) {
   }
 }
 
+/**
+ * POST /api/docflow/notes  body {sessionId, file, action?, note?, id?, supersede?}
+ * v1.4.0 (issue #17): panel-native note writes. Same session/file anchoring and
+ * loopback fence as the lease route; action add|list|address|supersede|restore.
+ */
+function makeNotesRoute(ctx) {
+  return {
+    method: 'POST',
+    path: '/api/docflow/notes',
+    handler: async (req, res) => {
+      try {
+        if (!isLoopbackRequest(req)) return leaseRespond(res, 403, { ok: false, error: 'loopback only' })
+        const body = await readJsonBody(req)
+        if (!body || typeof body.sessionId !== 'string' || typeof body.file !== 'string')
+          return leaseRespond(res, 400, { ok: false, error: 'notes requires {sessionId, file, …}' })
+        const session = ctx.sessions.get(body.sessionId)
+        const wd = ctx.workingDirectory
+        const dir = session ? wd.get(session) : wd.defaultDirectory
+        if (!dir) return leaseRespond(res, 404, { ok: false, error: 'unknown session' })
+        const rel = path.normalize(body.file)
+        if (path.isAbsolute(rel) || rel.startsWith('..') || !rel.endsWith('state.json'))
+          return leaseRespond(res, 400, { ok: false, error: 'file must be a workspace-relative <dir>/state.json path' })
+        const statePath = path.resolve(dir, rel)
+        if (!statePath.startsWith(path.resolve(dir) + path.sep)) return leaseRespond(res, 400, { ok: false, error: 'outside workspace' })
+        const out = await notesHandle(statePath, body)
+        return leaseRespond(res, out.status, out.body)
+      } catch {
+        return leaseRespond(res, 500, { ok: false, error: 'notes failed' })
+      }
+    },
+  }
+}
+
 export function apply(ctx) {
   return ctx.effect(() => {
     const offTool = ctx.tools.register(makeTool(ctx))
@@ -1883,11 +2289,14 @@ export function apply(ctx) {
       ctx.inject(['webServer'], (host) => {
         host.effect(() => {
           const offRoute = host.webServer.register(makeLeaseRoute(ctx))
+          // v1.4.0 (issue #17): panel-native note writes ride the same fence
+          const offNotesRoute = host.webServer.register(makeNotesRoute(ctx))
           return () => {
+            offNotesRoute()
             offRoute()
             leaseReleaseAll()
           }
-        }, 'docflow: panel lease route')
+        }, 'docflow: panel lease + notes routes')
       })
     }
     return () => {

@@ -2,7 +2,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import assert from 'node:assert'
-import { apply, leaseApi } from '../index.js'
+import { apply, leaseApi, notesApi } from '../index.js'
 
 const ROOT = process.cwd()
 const WS = path.join(ROOT, 'ws')
@@ -41,6 +41,57 @@ function stubTool(defaultDirectory) {
   return { tool, disposers }
 }
 
+/** v1.4.0 (issue #17): stub ctx that captures webServer routes (loopback fence tests). */
+function stubToolWithWeb(defaultDirectory) {
+  let tool
+  const routes = []
+  const disposers = []
+  apply({
+    effect: (fn) => { const c = fn(); disposers.push(typeof c === 'function' ? c : () => {}); return c },
+    tools: { register: (t) => { tool = t; return () => {} } },
+    systemPrompt: { section: () => () => {} },
+    sessions: { get: () => undefined },
+    workingDirectory: { defaultDirectory },
+    inject: (services, cb) => {
+      if (services.includes('webServer'))
+        cb({ effect: (fn) => { const c = fn(); if (typeof c === 'function') disposers.push(c); return c }, webServer: { register: (rt) => { routes.push(rt); return () => {} } } })
+    },
+  })
+  return { tool, routes, disposers }
+}
+
+/** Fake node-http req for route handlers (loopback fence + JSON body). */
+function fakeReq(body, opts = {}) {
+  const address = opts.address || '127.0.0.1'
+  const host = opts.host || '127.0.0.1:3080'
+  const headers = { host }
+  if (opts.origin !== undefined) headers.origin = opts.origin
+  if (opts.secFetchSite !== undefined) headers['sec-fetch-site'] = opts.secFetchSite
+  const payload = Buffer.from(JSON.stringify(body))
+  return {
+    socket: { remoteAddress: address },
+    headers,
+    [Symbol.asyncIterator]: () => {
+      let done = false
+      return { next: async () => (done ? { done: true, value: undefined } : ((done = true), { done: false, value: payload })) }
+    },
+  }
+}
+
+function fakeRes() {
+  return {
+    status: 0,
+    body: '',
+    writeHead(status, headers) {
+      this.status = status
+      this.headers = headers
+    },
+    end(body) {
+      this.body = body
+    },
+  }
+}
+
 const { tool, disposers } = stubTool(WS)
 const results = []
 let n = 0
@@ -74,6 +125,7 @@ function v3State(overrides) {
     consistency: { status: 'passed', verdicts: {}, updatedAt: 'x' },
     entries: { U1: { useful: true, title: 't', content: 'c', source_kind: 'doc', source_file: 'docs/api.md', source_quote: 'The billing team confirmed that Billing API v2 goes live on 2026-03-01.', addedAt: 'x' } },
     pendingDocs: [], plan: { writtenAt: 'x', notes: 'NOTES.md', plan: 'PLAN.md' },
+    notes: [], supersedions: [],
     createdAt: 'x', updatedAt: 'x',
     ...overrides,
   }
@@ -921,6 +973,183 @@ r = await call({ action: 'ingest', paths: ['docs/new.md'] })
   r = await callOn(tp, { action: 'verify' })
   record('P4', r.passed === true && r.pending_cleared === undefined, 'a passing verify with nothing pending stays silent (idempotent)')
   dp.forEach((x) => x())
+}
+
+// 23. v1.4.0 review notes — issue #17 (checks NT1..NT18)
+{
+  const dirp = path.join(ROOT, 'ws-notes')
+  await fs.rm(dirp, { recursive: true, force: true })
+  await fs.mkdir(path.join(dirp, 'docs'), { recursive: true })
+  await fs.mkdir(path.join(dirp, '.doc-workflow'), { recursive: true })
+  await fs.writeFile(path.join(dirp, 'docs/api.md'), 'The billing team confirmed that Billing API v2 goes live on 2026-03-01.\n', 'utf8')
+  await fs.writeFile(path.join(dirp, 'docs/d.md'), 'Delta rollout runs behind a feature flag.\n', 'utf8')
+  const stateFile = path.join(dirp, '.doc-workflow/state.json')
+  const readSt = async () => JSON.parse(await fs.readFile(stateFile, 'utf8'))
+  const twoEntries = {
+    U1: { useful: true, title: 'launch', content: 'v2 goes live 2026-03-01', source_kind: 'doc', source_file: 'docs/api.md', source_quote: 'The billing team confirmed that Billing API v2 goes live on 2026-03-01.', addedAt: 'x' },
+    U2: { useful: true, title: 'delta', content: 'delta behind flag', source_kind: 'doc', source_file: 'docs/d.md', source_quote: 'Delta rollout runs behind a feature flag.', addedAt: 'x' },
+  }
+  const legacy = v3State({ stage: 'consistency', entries: twoEntries })
+  delete legacy.notes
+  delete legacy.supersedions
+  await fs.writeFile(stateFile, JSON.stringify(legacy), 'utf8')
+  const { tool: tn, routes: routesN, disposers: dn } = stubToolWithWeb(dirp)
+  const notesRoute = routesN.find((rt) => rt.path === '/api/docflow/notes')
+  const leaseRoute = routesN.find((rt) => rt.path === '/api/docflow/lease')
+
+  // NT1: tool surface — action enum + note params
+  const props = tn.parameters.properties
+  record('NT1', props.action.enum.includes('note') && Array.isArray(props.note_action.enum) &&
+    props.note_action.enum.join(',') === 'add,list,address,restore,supersede' &&
+    props.note.properties.type.enum.join(',') === 'FACT,SUGGESTION,GUIDANCE,CONSTRAINT' &&
+    props.supersede.required.join(',') === 'fact,entry,winner',
+    'tool schema exposes note action + note_action/note/supersede params')
+
+  // NT2: migration — v3 state without notes gains the shells on load (status persists them)
+  await callOn(tn, { action: 'status' })
+  let st = await readSt()
+  record('NT2', Array.isArray(st.notes) && st.notes.length === 0 && Array.isArray(st.supersedions) && st.supersedions.length === 0,
+    'migrateState fills notes/supersedions shells (additive, version stays 3)')
+
+  // NT3: add GUIDANCE on U1 → state + index.md + status next
+  let r = await callOn(tn, { action: 'note', note_action: 'add', note: { target: 'U1', type: 'GUIDANCE', body: 'Emphasize cost impact in the client summary.' } })
+  st = await readSt()
+  const idx = await fs.readFile(path.join(dirp, '.doc-workflow/index.md'), 'utf8')
+  record('NT3', r.ok && r.note.id === 'NOTE1' && r.note.status === 'open' && r.note.author === 'human' &&
+    st.notes.length === 1 && idx.includes('## Review notes') && idx.includes('### On `U1`') &&
+    (r.next || []).some((s) => /OPEN NOTES \(1\)/.test(s) && s.includes('NOTE1→U1')),
+    'panel-parity note add lands in state.notes + index.md and surfaces in status next')
+
+  // NT4: add FACT on U1 → F×U pairs appear (U1|U2 + NOTE1|U1 + NOTE1|U2), consistency pending
+  r = await callOn(tn, { action: 'note', note_action: 'add', note: { target: 'U1', type: 'FACT', body: 'Launch moved to 2026-06-15, decided yesterday.' } })
+  record('NT4', r.ok && r.note.id === 'NOTE2' && r.consistency === 'pending' && r.pairs === 3 &&
+    JSON.stringify((await readSt()).consistency.verdicts) === '{}',
+    'FACT note joins the matrix: pairs grow by one per useful entry, verdicts reset to pending')
+
+  // NT5: supersede requires a recorded conflict
+  r = await callOn(tn, { action: 'note', note_action: 'supersede', supersede: { fact: 'NOTE2', entry: 'U1', winner: 'fact' } })
+  record('NT5', !r.ok && /conflict verdict/.test(String(r.error)), 'supersede refuses before crosscheck records the conflict')
+
+  // NT6: crosscheck all pairs, NOTE2|U1 conflict → consistency conflict
+  r = await callOn(tn, { action: 'crosscheck', verdicts: [
+    { a: 'U1', b: 'U2', verdict: 'consistent' },
+    { a: 'NOTE2', b: 'U1', verdict: 'conflict', note: 'dates disagree' },
+    { a: 'NOTE2', b: 'U2', verdict: 'consistent' },
+  ] })
+  record('NT6', !r.ok && r.consistency === 'conflict' && (r.conflicts || []).length === 1 && r.conflicts[0].pair === 'NOTE2|U1',
+    'crosscheck accepts NOTE ids; F×U conflict marks the matrix conflict (ok=false blocks the flow)')
+
+  // NT7: supersede winner=fact → U1 superseded by NOTE2, note addressed, SUP1 recorded; matrix re-derives
+  r = await callOn(tn, { action: 'note', note_action: 'supersede', supersede: { fact: 'NOTE2', entry: 'U1', winner: 'fact' } })
+  st = await readSt()
+  record('NT7', r.ok && r.supersession.id === 'SUP1' && r.supersession.kind === 'entry→fact' &&
+    r.supersession.fromId === 'U1' && r.supersession.toId === 'NOTE2' &&
+    st.entries.U1.superseded && st.entries.U1.superseded.by === 'NOTE2' &&
+    st.notes.find((n) => n.id === 'NOTE2').status === 'addressed' &&
+    r.consistency === 'n/a' && r.stage === 'indexing',
+    'supersede entry→fact: loser marked, winner consumed, matrix shrinks (U1 exits), verification stale')
+  const idx2 = await fs.readFile(path.join(dirp, '.doc-workflow/index.md'), 'utf8')
+  record('NT8', idx2.includes('### Supersessions') && idx2.includes('**SUP1** entry→fact: `U1` superseded by `NOTE2`'),
+    'index.md renders the supersession history')
+
+  // NT9: restore SUP1 → U1 back, NOTE2 deleted, matrix re-opens
+  r = await callOn(tn, { action: 'note', note_action: 'restore', id: 'SUP1' })
+  st = await readSt()
+  record('NT9', r.ok && r.restored.id === 'SUP1' && !st.entries.U1.superseded &&
+    !st.notes.some((n) => n.id === 'NOTE2') && st.supersedions.length === 0 &&
+    r.consistency === 'pending' && r.pairs === 1 && r.stage === 'consistency',
+    'restore inverts the supersession: entry re-activated, winning fact withdrawn, matrix re-opens (U×U only, verdicts cleared)')
+
+  // NT10: supersede winner=entry → the fact is superseded, U1 stays; restore re-opens it
+  r = await callOn(tn, { action: 'note', note_action: 'add', note: { target: 'U1', type: 'FACT', body: 'Launch moved to 2026-06-15, decided yesterday.' } })
+  const factId = r.note.id
+  await callOn(tn, { action: 'attest', verdict: 'ok', ids: ['ALL'] }) // fixture entries carry no attest block
+  await callOn(tn, { action: 'verify' }) // restore staled verification; re-verify to reopen the matrix
+  await callOn(tn, { action: 'crosscheck', verdicts: [
+    { a: 'U1', b: 'U2', verdict: 'consistent' },
+    { a: factId, b: 'U1', verdict: 'conflict', note: 'dates disagree' },
+    { a: factId, b: 'U2', verdict: 'consistent' },
+  ] })
+  r = await callOn(tn, { action: 'note', note_action: 'supersede', supersede: { fact: factId, entry: 'U1', winner: 'entry' } })
+  st = await readSt()
+  record('NT10', r.ok && r.supersession.kind === 'fact→entry' && !st.entries.U1.superseded &&
+    st.notes.find((n) => n.id === factId).status === 'superseded' &&
+    st.supersedions[0].fromId === factId && st.supersedions[0].toId === 'U1',
+    'supersede fact→entry: the fact is dropped, the entry stays authoritative')
+  r = await callOn(tn, { action: 'note', note_action: 'restore', id: 'SUP1' })
+  st = await readSt()
+  record('NT11', r.ok && st.notes.find((n) => n.id === factId).status === 'open' && st.supersedions.length === 0,
+    'restore of a fact→entry supersession re-opens the fact note')
+
+  // NT12: address via tool; address again refused
+  r = await callOn(tn, { action: 'note', note_action: 'address', id: 'NOTE1' })
+  const r2 = await callOn(tn, { action: 'note', note_action: 'address', id: 'NOTE1' })
+  record('NT12', r.ok && r.note.status === 'addressed' && !r2.ok && /already addressed/.test(String(r2.error)),
+    'address marks the note consumed; double-address fails')
+
+  // NT13: list
+  r = await callOn(tn, { action: 'note', note_action: 'list' })
+  record('NT13', r.ok && r.notes.length === 2 && r.supersedions.length === 0 && r.notes[0].id === 'NOTE1',
+    'note list returns notes + supersedions')
+
+  // NT14: validation — unknown target, bad type, oversize body write NOTHING
+  const before = await fs.readFile(stateFile, 'utf8')
+  r = await callOn(tn, { action: 'note', note_action: 'add', note: { target: 'U9', type: 'FACT', body: 'x' } })
+  const rBadType = await callOn(tn, { action: 'note', note_action: 'add', note: { target: 'U1', type: 'QUESTION', body: 'x' } })
+  const rBig = await callOn(tn, { action: 'note', note_action: 'add', note: { target: 'U1', type: 'SUGGESTION', body: 'x'.repeat(4001) } })
+  const after = await fs.readFile(stateFile, 'utf8')
+  record('NT14', !r.ok && !rBadType.ok && !rBig.ok && before === after &&
+    /QUESTION/.test(String(rBadType.error)),
+    'unknown target / QUESTION type / oversize body all rejected with zero writes')
+
+  // NT15: role-card target (preset 'Migrator' exists in v3State; 'ghost' does not)
+  r = await callOn(tn, { action: 'note', note_action: 'add', note: { target: 'Migrator', type: 'CONSTRAINT', body: 'Card must keep the write_scope.' } })
+  const rGhost = await callOn(tn, { action: 'note', note_action: 'add', note: { target: 'ghost', type: 'SUGGESTION', body: 'x' } })
+  record('NT15', r.ok && r.note.target === 'Migrator' && !rGhost.ok, 'notes can target emitted role cards; unknown roles rejected')
+
+  // NT16: notes survive reflow(reading) + ingest untouched
+  const notesBefore = JSON.stringify((await readSt()).notes)
+  r = await callOn(tn, { action: 'reflow', to_stage: 'reading' })
+  const notesAfter = JSON.stringify((await readSt()).notes)
+  await fs.writeFile(path.join(dirp, 'docs/new.md'), 'A new document arrives after the reflow.\n', 'utf8')
+  r = await callOn(tn, { action: 'ingest', paths: ['docs/new.md'] })
+  const notesAfter2 = JSON.stringify((await readSt()).notes)
+  record('NT16', r.ok && notesBefore === notesAfter && notesBefore === notesAfter2 && JSON.parse(notesBefore).length === 3,
+    'notes survive reflow + ingest untouched (3 notes kept)')
+
+  // NT17: route — loopback add, non-loopback 403, origin mismatch 403, path escape 400, lease route intact
+  const resA = fakeRes()
+  await notesRoute.handler(fakeReq({ sessionId: 's', file: '.doc-workflow/state.json', action: 'add', note: { target: 'U2', type: 'SUGGESTION', body: 'route add' } }), resA)
+  const bodyA = JSON.parse(resA.body)
+  const resN = fakeRes()
+  await notesRoute.handler(fakeReq({ sessionId: 's', file: '.doc-workflow/state.json', action: 'add', note: { target: 'U2', type: 'SUGGESTION', body: 'nope' } }, { address: '10.0.0.5' }), resN)
+  const resO = fakeRes()
+  await notesRoute.handler(fakeReq({ sessionId: 's', file: '.doc-workflow/state.json', action: 'list' }, { origin: 'http://evil.example' }), resO)
+  const resP = fakeRes()
+  await notesRoute.handler(fakeReq({ sessionId: 's', file: '../etc/state.json', action: 'list' }), resP)
+  const resB = fakeRes()
+  await notesRoute.handler(fakeReq({ sessionId: 's', file: '.doc-workflow/state.json', action: 'explode' }), resB)
+  const st17 = await readSt()
+  record('NT17', resA.status === 200 && bodyA.ok && bodyA.note.id &&
+    resN.status === 403 && resO.status === 403 && resP.status === 400 && resB.status === 400 &&
+    st17.notes.some((n) => n.id === bodyA.note.id && n.body === 'route add') &&
+    !st17.notes.some((n) => n.body === 'nope') &&
+    leaseRoute && leaseRoute.method === 'POST' && notesRoute.method === 'POST',
+    'notes route: loopback add persists; non-loopback/origin-mismatch 403; path escape + bad action 400; lease route co-registered')
+
+  // NT18: concurrency — lease reconcile + note add in parallel keep BOTH effects (state lock)
+  await fs.writeFile(path.join(dirp, 'docs/late.md'), 'late doc\n', 'utf8')
+  const [okL, outN] = await Promise.all([
+    leaseApi.reconcile(stateFile),
+    notesApi.handle(stateFile, { action: 'add', note: { target: 'U1', type: 'SUGGESTION', body: 'concurrent note' } }),
+  ])
+  const st18 = await readSt()
+  record('NT18', okL === true && outN.status === 200 &&
+    (st18.discoveredDocs || []).some((d) => d.path === 'docs/late.md') &&
+    st18.notes.some((n) => n.body === 'concurrent note'),
+    'concurrent lease-reconcile + note-add under the state lock keep both effects')
+
+  dn.forEach((x) => x())
 }
 
 console.log(results.join('\n'))

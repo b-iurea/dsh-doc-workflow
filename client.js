@@ -177,6 +177,26 @@
           'reflow.noinfo': 'No run info for this step.',
           'reflow.docs': 'document roots',
           'reflow.entries': 'entries',
+          'notes': 'Review notes',
+          'notes.none': 'no notes yet',
+          'notes.open': 'open',
+          'notes.addressed': 'addressed',
+          'notes.superseded': 'superseded',
+          'notes.address': 'mark addressed',
+          'notes.restore': 'restore',
+          'notes.supersedions': 'Supersessions',
+          'notes.hint': 'Your notes for the agent — FACT (a truth from you, no quote needed), SUGGESTION, GUIDANCE, CONSTRAINT.',
+          'notes.composer': 'Add a note',
+          'notes.target': 'About',
+          'notes.type': 'Type',
+          'notes.bodyPh': 'Write your note…',
+          'notes.add': 'Add',
+          'notes.saving': 'saving…',
+          'notes.sent': 'saved ✓',
+          'notes.failed': 'save failed',
+          'notes.needfields': 'Pick a target and write the note first.',
+          'notes.addFor': 'note',
+          'notes.unavailable': 'Note writes need the host web server (this panel is read-only here).',
         },
         it: {
           'title': 'Docflow',
@@ -296,6 +316,26 @@
           'reflow.noinfo': 'Nessuna info di esecuzione per questo passo.',
           'reflow.docs': 'radici documenti',
           'reflow.entries': 'voci',
+          'notes': 'Note di revisione',
+          'notes.none': 'nessuna nota',
+          'notes.open': 'aperta',
+          'notes.addressed': 'gestita',
+          'notes.superseded': 'sostituita',
+          'notes.address': 'segna come gestita',
+          'notes.restore': 'ripristina',
+          'notes.supersedions': 'Sostituzioni',
+          'notes.hint': 'Le tue note per l’agente — FACT (una verità da te, niente citazione), SUGGESTION, GUIDANCE, CONSTRAINT.',
+          'notes.composer': 'Aggiungi una nota',
+          'notes.target': 'Riguardo a',
+          'notes.type': 'Tipo',
+          'notes.bodyPh': 'Scrivi la nota…',
+          'notes.add': 'Aggiungi',
+          'notes.saving': 'salvataggio…',
+          'notes.sent': 'salvata ✓',
+          'notes.failed': 'salvataggio non riuscito',
+          'notes.needfields': 'Scegli una destinazione e scrivi la nota.',
+          'notes.addFor': 'nota',
+          'notes.unavailable': 'La scrittura di note richiede il web server dell’host (qui il pannello è di sola lettura).',
         },
       };
 
@@ -397,6 +437,17 @@
         '.dfp-input{font:inherit;font-size:10.5px;width:100%;box-sizing:border-box;' +
           'color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);' +
           'border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:3px 6px;}',
+        '.dfp-note{display:flex;flex-direction:column;gap:3px;padding:6px 8px;border:1px solid var(--dsw-alias-border-l1);' +
+          'border-radius:6px;background:var(--dsw-alias-bg-layer-2);margin:4px 0;}',
+        '.dfp-nrow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}',
+        '.dfp-nbody{color:var(--dsw-alias-label-secondary);font-size:11.5px;white-space:pre-wrap;overflow-wrap:anywhere;}',
+        '.dfp-sup{opacity:.6;}',
+        '.dfp-ta{font:inherit;font-size:11.5px;color:inherit;background:var(--dsw-alias-bg-layer-1);' +
+          'border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:5px 8px;width:100%;' +
+          'box-sizing:border-box;min-height:46px;resize:vertical;}',
+        '.dfp-composer{display:flex;flex-direction:column;gap:6px;padding:8px;margin-top:6px;' +
+          'border:1px dashed var(--dsw-alias-border-l2);border-radius:8px;}',
+        '.dfp-ctrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}',
       ].join('\n');
 
       // ---------------------------------------------------------------- helpers
@@ -429,6 +480,9 @@
       var CONS_CHIP = { 'n/a': 'dfp-c-neutral', 'passed': 'dfp-c-success', 'pending': 'dfp-c-warn', 'conflict': 'dfp-c-error' };
       var PRESET_CHIP = { 'none': 'dfp-c-neutral', 'emitted': 'dfp-c-success', 'skipped': 'dfp-c-neutral', 'stale': 'dfp-c-warn' };
       var TASK_CHIP = { 'pending': 'dfp-c-neutral', 'emitted': 'dfp-c-success', 'skipped': 'dfp-c-neutral', 'stale': 'dfp-c-warn' };
+      // v1.4.0 (issue #17): note status + type chip maps
+      var NOTE_CHIP = { 'open': 'dfp-c-brand', 'addressed': 'dfp-c-success', 'superseded': 'dfp-c-neutral' };
+      var NOTE_TYPE_CHIP = { 'FACT': 'dfp-c-brand', 'SUGGESTION': 'dfp-c-success', 'GUIDANCE': 'dfp-c-neutral', 'CONSTRAINT': 'dfp-c-warn' };
       var STEPS = ['reading', 'indexing', 'consistency', 'gaps', 'interview', 'presets', 'plan', 'tasks', 'done'];
 
       // DESIGN-v1.3.1 §1: the legal reflow targets (the rail minus `done`).
@@ -562,6 +616,14 @@
           var copied = _copied[0], setCopied = _copied[1];
           var _pick = React.useState({});       // v1.3.3: reflow(reading) — files checked for a selective re-read
           var pick = _pick[0], setPick = _pick[1];
+          var _nt = React.useState('');         // v1.4.0 (issue #17): composer — target, type, body, send status
+          var ntarget = _nt[0], setNtarget = _nt[1];
+          var _nty = React.useState('SUGGESTION');
+          var ntype = _nty[0], setNtype = _nty[1];
+          var _nb = React.useState('');
+          var nbody = _nb[0], setNbody = _nb[1];
+          var _ns = React.useState(null);       // { status: sending|sent|error, message }
+          var nsend = _ns[0], setNsend = _ns[1];
           var stageRef = React.useRef('');      // live stage, for async-send guards
           var _tick = React.useState(0);
           var tickv = _tick[0], setTickv = _tick[1];
@@ -723,6 +785,50 @@
               if (stageRef.current !== atStage) return;
               setReflow({ step: step, status: 'error', atStage: atStage, message: str((err && err.message) || err) });
             });
+          }
+
+          // ---- review notes (v1.4.0, issue #17): panel-native writes via POST /api/docflow/notes ----
+          function postNotes(payload) {
+            return new Promise(function (resolve, reject) {
+              if (typeof fetch !== 'function' || !live.sessionId || !live.file) {
+                reject(new Error(t('notes.unavailable')));
+                return;
+              }
+              var body = Object.assign({ sessionId: live.sessionId, file: live.file }, payload);
+              try {
+                fetch('/api/docflow/notes', {
+                  method: 'POST', headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify(body),
+                }).then(function (r) {
+                  return r.text().then(function (txt) {
+                    var parsed = null;
+                    try { parsed = JSON.parse(txt); } catch (e) { parsed = null; }
+                    if (r.status >= 200 && r.status < 300 && (!parsed || parsed.ok !== false)) resolve(parsed || {});
+                    else reject(new Error((parsed && parsed.error) || t('notes.failed') + ' (' + r.status + ')'));
+                  });
+                }, function (err) { reject(err); });
+              } catch (err) { reject(err); }
+            });
+          }
+          function addNote() {
+            var body = str(nbody).trim();
+            if (!ntarget || !body) { setNsend({ status: 'error', message: t('notes.needfields') }); return; }
+            setNsend({ status: 'sending' });
+            postNotes({ action: 'add', note: { target: ntarget, type: ntype, body: body } }).then(
+              function () { setNsend({ status: 'sent' }); setNbody(''); doRefresh(); },
+              function (err) { setNsend({ status: 'error', message: str((err && err.message) || err) }); });
+          }
+          function addressNote(id) {
+            setNsend({ status: 'sending' });
+            postNotes({ action: 'address', id: id }).then(
+              function () { setNsend({ status: 'sent' }); doRefresh(); },
+              function (err) { setNsend({ status: 'error', message: str((err && err.message) || err) }); });
+          }
+          function restoreSup(id) {
+            setNsend({ status: 'sending' });
+            postNotes({ action: 'restore', id: id }).then(
+              function () { setNsend({ status: 'sent' }); doRefresh(); },
+              function (err) { setNsend({ status: 'error', message: str((err && err.message) || err) }); });
           }
 
           // ---- small render helpers (defensive against any state shape) ----
@@ -1173,7 +1279,7 @@
               React.createElement('div', { class: 'dfp-box' }, kids));
           }
 
-          function entryDetail(e) {
+          function entryDetail(id, e) {
             var kids = [];
             kids.push(React.createElement('div', { key: 'c', class: 'dfp-k' }, t('e.content')));
             kids.push(React.createElement('div', { key: 'cv', class: 'dfp-v' }, str(e.content)));
@@ -1194,6 +1300,11 @@
             kids.push(React.createElement('div', { key: 'ttv', class: 'dfp-v' },
               at ? str(at.verdict) + (str(at.note) ? ' — ' + str(at.note) : '') + (str(at.at) ? ' · ' + fmtTime(at.at) : '') : t('e.notattested')));
             if (str(e.addedAt)) kids.push(React.createElement('div', { key: 'ad', class: 'dfp-k' }, t('e.added') + ' ' + fmtTime(e.addedAt)));
+            kids.push(React.createElement('div', { key: 'nb', class: 'dfp-row' },
+              React.createElement('button', {
+                class: 'dfp-btn',
+                onClick: function () { setNtarget(id); setNsend(null); },
+              }, t('notes.addFor'))));
             return React.createElement('div', { class: 'dfp-detail' }, kids);
           }
 
@@ -1219,7 +1330,7 @@
                 class: 'dfp-entry',
                 onClick: function () { setOpenId(openId === id ? null : id); },
               }, kids),
-              openId === id ? entryDetail(e) : null);
+              openId === id ? entryDetail(id, e) : null);
           }
 
           function renderEntries(S) {
@@ -1251,6 +1362,107 @@
               kids.push(React.createElement('div', { key: 'hn', class: 'dfp-k' }, t('entries.notuseful')));
               for (var n = 0; n < otherIds.length; n++) kids.push(renderEntry(otherIds[n], obj(entries[otherIds[n]])));
             }
+            return React.createElement('div', null, kids);
+          }
+
+          function noteTargets(S) {
+            var list = [];
+            var entries = obj(S.entries) || {};
+            var ids = Object.keys(entries).sort(function (a, b) {
+              return (Number(str(a).slice(1)) || 0) - (Number(str(b).slice(1)) || 0);
+            });
+            for (var i = 0; i < ids.length; i++) {
+              var e = obj(entries[ids[i]]);
+              if (e) list.push({ v: ids[i], label: ids[i] + ' — ' + midTruncate(str(e.title) || '—', 28) });
+            }
+            var presets = obj(S.presets);
+            if (presets && str(presets.status) === 'emitted') {
+              var cards = arr(presets.cards);
+              for (var c = 0; c < cards.length; c++) {
+                var card = obj(cards[c]);
+                if (card && str(card.role)) list.push({ v: str(card.role), label: str(card.role) + ' — ' + t('presets') });
+              }
+            }
+            list.push({ v: 'plan', label: 'plan — ' + t('plan') });
+            list.push({ v: 'notes', label: 'notes — NOTES.md' });
+            list.push({ v: 'objective', label: 'objective — ' + t('objective') });
+            return list;
+          }
+
+          function renderNotes(S) {
+            var notes = arr(S.notes);
+            var sups = arr(S.supersedions);
+            var targets = noteTargets(S);
+            if (notes.length === 0 && sups.length === 0 && targets.length === 0) return null;
+            var sending = !!(nsend && nsend.status === 'sending');
+            var kids = [React.createElement('div', { key: 'head', class: 'dfp-sec' }, t('notes'))];
+            if (notes.length === 0 && sups.length === 0)
+              kids.push(React.createElement('div', { key: 'none', class: 'dfp-none' }, t('notes.none')));
+            for (var i = 0; i < notes.length; i++) {
+              var n = obj(notes[i]);
+              if (!n) continue;
+              var st = str(n.status) || 'open';
+              var row = [
+                React.createElement('span', { key: 'id', class: 'dfp-code' }, str(n.id)),
+                React.createElement('span', { key: 'ty', class: 'dfp-chip ' + (NOTE_TYPE_CHIP[str(n.type)] || 'dfp-c-neutral') }, str(n.type)),
+                React.createElement('span', { key: 'tg', class: 'dfp-dash' }, '→ ' + str(n.target)),
+                React.createElement('span', { key: 'st', class: 'dfp-chip ' + (NOTE_CHIP[st] || 'dfp-c-neutral') }, t('notes.' + st) || st),
+                React.createElement('span', { key: 'at', class: 'dfp-dash' }, fmtTime(n.set_at || n.at))];
+              if (st === 'open')
+                row.push(React.createElement('button', {
+                  key: 'a', class: 'dfp-btn', disabled: sending,
+                  onClick: function () { addressNote(str(n.id)); },
+                }, t('notes.address')));
+              kids.push(React.createElement('div', { key: 'n' + i, class: 'dfp-note' + (st === 'superseded' ? ' dfp-sup' : '') },
+                React.createElement('div', { class: 'dfp-nrow' }, row),
+                React.createElement('div', { class: 'dfp-nbody' }, str(n.body))));
+            }
+            if (sups.length) {
+              kids.push(React.createElement('div', { key: 'sh', class: 'dfp-k' }, t('notes.supersedions')));
+              for (var s = 0; s < sups.length; s++) {
+                var sp = obj(sups[s]);
+                if (!sp) continue;
+                kids.push(React.createElement('div', { key: 's' + s, class: 'dfp-note dfp-sup' },
+                  React.createElement('div', { class: 'dfp-nrow' }, [
+                    React.createElement('span', { key: 'id', class: 'dfp-code' }, str(sp.id)),
+                    React.createElement('span', { key: 'kd', class: 'dfp-dash' },
+                      str(sp.fromId) + ' ' + str(sp.kind) + ' ' + str(sp.toId) + ' · ' + fmtTime(sp.at)),
+                    React.createElement('button', {
+                      key: 'r', class: 'dfp-btn', disabled: sending,
+                      onClick: function () { restoreSup(str(sp.id)); },
+                    }, t('notes.restore'))])));
+              }
+            }
+            var inTargets = false;
+            for (var tI = 0; tI < targets.length; tI++) if (targets[tI].v === ntarget) inTargets = true;
+            kids.push(React.createElement('div', { key: 'comp', class: 'dfp-composer' },
+              React.createElement('div', { class: 'dfp-k' }, t('notes.composer')),
+              React.createElement('div', { class: 'dfp-ctrow' },
+                React.createElement('select', {
+                  class: 'dfp-sel', value: inTargets ? ntarget : '',
+                  onChange: function (ev) { setNtarget(ev.target.value); setNsend(null); },
+                }, [React.createElement('option', { key: 'ph', value: '' }, t('notes.target'))].concat(targets.map(function (o, oi) {
+                  return React.createElement('option', { key: oi, value: o.v }, o.label);
+                }))),
+                React.createElement('select', {
+                  class: 'dfp-sel', value: ntype,
+                  onChange: function (ev) { setNtype(ev.target.value); },
+                }, ['FACT', 'SUGGESTION', 'GUIDANCE', 'CONSTRAINT'].map(function (ty) {
+                  return React.createElement('option', { key: ty, value: ty }, ty);
+                }))),
+              React.createElement('textarea', {
+                class: 'dfp-ta', value: nbody, maxLength: 4000,
+                placeholder: t('notes.bodyPh'),
+                onChange: function (ev) { setNbody(ev.target.value); },
+              }),
+              React.createElement('div', { class: 'dfp-ctrow' },
+                React.createElement('button', {
+                  class: 'dfp-btn', disabled: sending, onClick: addNote,
+                }, sending ? t('notes.saving') : t('notes.add')),
+                nsend && nsend.status === 'sent' ? React.createElement('span', { class: 'dfp-dash' }, t('notes.sent')) : null,
+                nsend && nsend.status === 'error'
+                  ? React.createElement('span', { class: 'dfp-warnbadge' }, str(nsend.message || t('notes.failed')))
+                  : null)));
             return React.createElement('div', null, kids);
           }
 
@@ -1348,6 +1560,7 @@
               renderPresets(S),
               renderTasks(S),
               renderVerification(S),
+              renderNotes(S),
               renderEntries(S),
               renderDiscovered(S),
               renderPending(S),
